@@ -430,6 +430,78 @@ def main():
 
     print(f"  Gated: {gated_count} strategies")
 
+    # Phase 6: Fine-tune around best val-passing strategy
+    # Best so far: GATED 24hMR(0.0025)+168hMOM(0.0030) vt=0.75
+    print("Phase 6: Fine-tuning around best val-passing params...")
+    finetune_count = 0
+
+    # Fine grid around mr=0.0025, mom=0.003, vt=0.75
+    for mr_scale in np.arange(0.0018, 0.0035, 0.0002):
+        for mom_scale in np.arange(0.0020, 0.0042, 0.0002):
+            for vol_thresh in np.arange(0.3, 1.3, 0.1):
+                for steepness in [2.0, 3.0, 5.0, 7.0]:
+                    def make_steep_gated(bf, vt, st):
+                        def fn(feats):
+                            base = bf(feats)
+                            gate = 1.0 / (1.0 + np.exp((feats[:, IDX_VOL24] - vt) * st))
+                            return base * gate
+                        return fn
+                    base_fn = make_pair_fn(3, 5, -1, mr_scale, +1, mom_scale)
+                    fn = make_steep_gated(base_fn, vol_thresh, steepness)
+                    preds = fn(features)
+                    sharpe, max_dd, n_trades = _quick_backtest(preds, close)
+                    if n_trades >= 20:
+                        proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
+                        if proxy > 0.0:
+                            strategies.append((proxy, fn,
+                                f"FT 24hMR({mr_scale:.4f})+168hMOM({mom_scale:.4f}) vt={vol_thresh:.2f} st={steepness:.0f}"))
+                            finetune_count += 1
+
+    # Phase 7: 3-feature gated combos — add 72hMR or RSI to the winning formula
+    print("Phase 7: 3-feature gated combos...")
+    triple_gated_count = 0
+
+    def make_triple_gated(fi, fj, fk, si, sc_i, sj, sc_j, sk, sc_k, vol_thresh, steepness=3.0):
+        def fn(feats):
+            base = si * feats[:, fi] * sc_i + sj * feats[:, fj] * sc_j + sk * feats[:, fk] * sc_k
+            gate = 1.0 / (1.0 + np.exp((feats[:, IDX_VOL24] - vol_thresh) * steepness))
+            return base * gate
+        return fn
+
+    # 24hMR + 168hMOM + 72hMR (add mean-reversion depth)
+    for sc24 in [0.001, 0.0015, 0.002, 0.0025, 0.003]:
+        for sc168 in [0.002, 0.0025, 0.003, 0.0035]:
+            for sc72 in [0.0005, 0.001, 0.0015, 0.002]:
+                for vt in [0.5, 0.75, 1.0]:
+                    fn = make_triple_gated(3, 5, 4, -1, sc24, +1, sc168, -1, sc72, vt)
+                    preds = fn(features)
+                    sharpe, max_dd, n_trades = _quick_backtest(preds, close)
+                    if n_trades >= 20:
+                        proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
+                        if proxy > 0.0:
+                            strategies.append((proxy, fn,
+                                f"TG 24hMR({sc24:.4f})+168hMOM({sc168:.4f})+72hMR({sc72:.4f}) vt={vt:.2f}"))
+                            triple_gated_count += 1
+
+    # 24hMR + 168hMOM + RSI (add momentum confirmation)
+    for sc24 in [0.001, 0.002, 0.0025, 0.003]:
+        for sc168 in [0.002, 0.003, 0.004]:
+            for rsi_sc in [0.001, 0.002, 0.003]:
+                for rsi_sign in [-1, +1]:
+                    for vt in [0.5, 0.75, 1.0]:
+                        fn = make_triple_gated(3, 5, 12, -1, sc24, +1, sc168, rsi_sign, rsi_sc, vt)
+                        preds = fn(features)
+                        sharpe, max_dd, n_trades = _quick_backtest(preds, close)
+                        if n_trades >= 20:
+                            proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
+                            if proxy > 0.0:
+                                rsi_s = "+" if rsi_sign > 0 else "-"
+                                strategies.append((proxy, fn,
+                                    f"TG 24hMR({sc24:.4f})+168hMOM({sc168:.4f})+RSI14({rsi_s}{rsi_sc:.4f}) vt={vt:.2f}"))
+                                triple_gated_count += 1
+
+    print(f"  Fine-tuned: {finetune_count}, Triple-gated: {triple_gated_count}")
+
     print(f"  Pairs: {pair_count} promising strategies")
     print(f"  Total: {len(strategies)}")
 
