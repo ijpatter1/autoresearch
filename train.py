@@ -100,26 +100,18 @@ def compute_targets(df: pd.DataFrame) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Model — Identity wrapper (passes through a fixed feature as prediction)
+# Model
 # ---------------------------------------------------------------------------
 
 N_FEATURES = len(RETURN_LOOKBACKS) + len(VOLATILITY_WINDOWS) + 1 + 2 + 2 + 1  # 14
 
-# Feature index for 168h return (the 6th feature, index 5)
-MOMENTUM_FEATURE_IDX = 5  # 168h return
-MOMENTUM_SCALE = 0.1  # scale factor to control trade frequency
-
 
 class ForwardReturnModel(nn.Module):
-    """Learned weighted combination of momentum features."""
+    """Linear model with learned feature weights."""
 
     def __init__(self, n_features: int = N_FEATURES):
         super().__init__()
-        # Just a single linear layer — learns optimal feature weights
         self.linear = nn.Linear(n_features, 1, bias=True)
-        # Initialize with small weights
-        nn.init.uniform_(self.linear.weight, -0.01, 0.01)
-        nn.init.zeros_(self.linear.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.linear(x).squeeze(-1)
@@ -174,28 +166,6 @@ def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
-# Custom Loss: Sharpe-inspired directional loss
-# ---------------------------------------------------------------------------
-
-class DirectionalLoss(nn.Module):
-    """Loss that rewards correct direction of prediction.
-
-    Combines MSE with a penalty for wrong-direction predictions.
-    """
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-        # MSE component (small weight - just for magnitude guidance)
-        mse = torch.mean((pred - target) ** 2)
-
-        # Directional component: penalize when sign(pred) != sign(target)
-        # Use soft sign agreement: pred * target > 0 means same direction
-        direction_agreement = pred * target
-        # Penalize disagreements more than rewarding agreements
-        direction_loss = -torch.mean(torch.tanh(direction_agreement * 100))
-
-        return 0.1 * mse + direction_loss
-
-
-# ---------------------------------------------------------------------------
 # Main Training Loop
 # ---------------------------------------------------------------------------
 
@@ -231,29 +201,46 @@ def main():
     features = _normalize(features, fit=True)
     features = np.nan_to_num(features, nan=0.0)
 
-    # Clip extreme target outliers
-    target_std = np.std(targets)
-    target_mean = np.mean(targets)
-    targets = np.clip(targets, target_mean - 3 * target_std, target_mean + 3 * target_std)
-
     print(f"  Training samples: {len(features)}, Features: {features.shape[1]}")
+
+    # --- First, test raw momentum strategies to find what works ---
+    # Test: use -1 * (24h return) as prediction (mean reversion)
+    # Feature index 3 = 24h return (after normalization)
+    # Test a few simple strategies on train data to pick best direction
+
+    # Strategy: negative 72h return (mean reversion on medium term)
+    # Feature 4 = 72h return, Feature 5 = 168h return
+    for feat_idx, feat_name, sign in [
+        (3, "24h_return", -1),   # mean reversion
+        (3, "24h_return", +1),   # momentum
+        (4, "72h_return", -1),   # mean reversion
+        (4, "72h_return", +1),   # momentum
+        (5, "168h_return", -1),  # mean reversion
+        (5, "168h_return", +1),  # momentum
+    ]:
+        test_preds = sign * features[:, feat_idx] * 0.01  # small scale
+        n_above = np.sum(test_preds > 0.005)
+        n_below = np.sum(test_preds < -0.005)
+        # Quick directional accuracy check
+        agree = np.mean(np.sign(test_preds) == np.sign(targets))
+        print(f"  {feat_name} sign={sign:+d}: long={n_above}, short={n_below}, dir_acc={agree:.3f}")
 
     # --- Setup model ---
     model = ForwardReturnModel(n_features=features.shape[1]).to(device)
     n_params = count_model_params(model)
     print(f"  Model parameters: {n_params}")
 
-    # Train with directional loss and heavy L2 to keep weights small
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-2)
-    loss_fn = DirectionalLoss()
+    # Use Huber loss with very strong weight decay
+    optimizer = torch.optim.SGD(model.parameters(), lr=1e-4, weight_decay=1e-1)
+    loss_fn = nn.HuberLoss(delta=0.005)
 
     # --- Create DataLoader ---
     X_tensor = torch.tensor(features, dtype=torch.float32)
     y_tensor = torch.tensor(targets, dtype=torch.float32)
     dataset = TensorDataset(X_tensor, y_tensor)
-    loader = DataLoader(dataset, batch_size=2048, shuffle=True, drop_last=False)
+    loader = DataLoader(dataset, batch_size=len(features), shuffle=False, drop_last=False)
 
-    # --- Train ---
+    # --- Train (very few epochs for linear model — converges fast) ---
     print(f"Training for up to {TIME_BUDGET}s...")
     train_start = time.time()
     epoch = 0
@@ -273,7 +260,6 @@ def main():
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
 
             epoch_loss += loss.item()
@@ -282,10 +268,15 @@ def main():
             if time.time() - train_start >= TIME_BUDGET:
                 break
 
-        if epoch % 50 == 0 or epoch == 1:
+        if epoch % 100 == 0 or epoch == 1:
             avg_loss = epoch_loss / max(n_batches, 1)
             elapsed = time.time() - train_start
-            print(f"  Epoch {epoch:4d} | loss={avg_loss:.6f} | {elapsed:.1f}s")
+
+            # Check model weights
+            w = model.linear.weight.data.cpu().numpy().flatten()
+            b = model.linear.bias.data.cpu().numpy().item()
+            print(f"  Epoch {epoch:4d} | loss={avg_loss:.6f} | bias={b:.6f} | {elapsed:.1f}s")
+            print(f"    weights: {np.array2string(w, precision=4, separator=', ')}")
 
     training_seconds = time.time() - train_start
     print(f"Training complete: {epoch} epochs in {training_seconds:.1f}s")
@@ -298,7 +289,6 @@ def main():
     with torch.no_grad():
         all_preds = model(X_tensor.to(device)).cpu().numpy()
 
-    # Print prediction stats for debugging
     print(f"  Pred stats: mean={np.mean(all_preds):.6f}, std={np.std(all_preds):.6f}, "
           f"min={np.min(all_preds):.6f}, max={np.max(all_preds):.6f}")
     print(f"  Preds > 0.005: {np.sum(all_preds > 0.005)}, Preds < -0.005: {np.sum(all_preds < -0.005)}")
