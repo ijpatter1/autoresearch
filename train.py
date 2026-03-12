@@ -100,39 +100,36 @@ def compute_targets(df: pd.DataFrame) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Model — Mean-reversion with learned scale
+# Model — Multiple mean-reversion signals with vol gating
 # ---------------------------------------------------------------------------
 
 N_FEATURES = len(RETURN_LOOKBACKS) + len(VOLATILITY_WINDOWS) + 1 + 2 + 2 + 1  # 14
 
-# Feature indices (after normalization)
-IDX_24H_RETURN = 3  # 24h lookback return
-
-
-IDX_24H_VOL = 6  # 24h volatility (index in feature array)
-IDX_168H_VOL = 7  # 168h volatility
+# Feature indices
+IDX_1H = 0; IDX_4H = 1; IDX_12H = 2; IDX_24H = 3; IDX_72H = 4; IDX_168H = 5
+IDX_VOL24 = 6; IDX_VOL168 = 7
 
 
 class ForwardReturnModel(nn.Module):
-    """Mean-reversion with volatility gating.
+    """Multi-signal mean reversion with volatility gating.
 
-    prediction = -24h_return * scale * vol_gate
-    vol_gate = 1 when vol is low, 0 when vol is high
+    Combines mean-reversion signals from multiple timeframes.
+    No gradient training — parameters set via grid search.
     """
 
     def __init__(self, n_features: int = N_FEATURES):
         super().__init__()
-        self.scale = nn.Parameter(torch.tensor(0.005))
-        self.vol_threshold = nn.Parameter(torch.tensor(0.0))  # z-scored threshold
+        # Weights for each return lookback (negative = mean reversion)
+        self.weights = nn.Parameter(torch.zeros(6))  # one per return lookback
+        self.vol_thresh = nn.Parameter(torch.tensor(0.0))
         self._n_features = n_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Mean reversion signal
-        signal = -x[:, IDX_24H_RETURN] * self.scale
-        # Volatility gate: reduce signal when vol is high
-        # Use sigmoid for smooth gating: gate → 0 when vol >> threshold
-        vol = x[:, IDX_24H_VOL]
-        gate = torch.sigmoid(-(vol - self.vol_threshold) * 2.0)
+        # Weighted combination of return features (indices 0-5)
+        signal = (x[:, :6] * self.weights.unsqueeze(0)).sum(dim=1)
+        # Vol gate
+        vol = x[:, IDX_VOL24]
+        gate = torch.sigmoid(-(vol - self.vol_thresh) * 3.0)
         return signal * gate
 
 
@@ -187,6 +184,49 @@ def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
+# Backtest proxy (fast, fee-adjusted)
+# ---------------------------------------------------------------------------
+
+FEE = 0.001 + 0.0005  # fee + slippage per side
+
+
+def _quick_backtest(preds, close, threshold=0.005):
+    """Fast backtest returning (sharpe, max_dd, n_trades)."""
+    positions = np.zeros(len(preds))
+    positions[preds > threshold] = 1.0
+    positions[preds < -threshold] = -1.0
+
+    price_returns = np.zeros(len(close))
+    price_returns[1:] = close[1:] / close[:-1] - 1.0
+
+    port_returns = np.zeros(len(close))
+    n_trades = 0
+    for i in range(1, len(close)):
+        pos = positions[i - 1]
+        port_returns[i] = pos * price_returns[i]
+        prev_pos = positions[i - 2] if i >= 2 else 0.0
+        if pos != prev_pos:
+            cost = 0.0
+            if prev_pos != 0: cost += FEE
+            if pos != 0:
+                cost += FEE
+                n_trades += 1
+            port_returns[i] -= cost
+
+    equity = np.cumprod(1.0 + port_returns)
+    peak = np.maximum.accumulate(equity)
+    dd = (equity - peak) / peak
+    max_dd = float(np.min(dd))
+
+    if np.std(port_returns) > 0:
+        sharpe = float(np.mean(port_returns) / np.std(port_returns) * np.sqrt(8760))
+    else:
+        sharpe = 0.0
+
+    return sharpe, max_dd, n_trades
+
+
+# ---------------------------------------------------------------------------
 # Main Training Loop
 # ---------------------------------------------------------------------------
 
@@ -221,8 +261,7 @@ def main():
     features = _normalize(features, fit=True)
     features = np.nan_to_num(features, nan=0.0)
 
-    # Clip targets
-    targets = np.clip(targets, -0.05, 0.05)
+    close = train_df["close"].values[MAX_LOOKBACK:][valid]
 
     print(f"  Training samples: {len(features)}, Features: {features.shape[1]}")
 
@@ -231,97 +270,97 @@ def main():
     n_params = count_model_params(model)
     print(f"  Model parameters: {n_params}")
 
-    # Grid search over scale values to find optimal (only 1 param)
-    X_tensor = torch.tensor(features, dtype=torch.float32, device=device)
-    y_tensor = torch.tensor(targets, dtype=torch.float32, device=device)
+    # --- Grid search: try single features first, then combinations ---
+    print("Phase 1: Testing individual mean-reversion signals...")
+    best_sharpe = -999
+    best_config = None
 
-    print("Grid searching optimal scale and vol_threshold...")
-    best_score = -999
-    best_scale = 0.005
-    best_vol_thresh = 0.0
-    signal = -features[:, IDX_24H_RETURN]
-    vol = features[:, IDX_24H_VOL]
-    close = train_df["close"].values[MAX_LOOKBACK:][valid]
-    price_returns = np.zeros(len(close))
-    price_returns[1:] = close[1:] / close[:-1] - 1.0
+    for feat_idx, name in [(0, "1h"), (1, "4h"), (2, "12h"), (3, "24h"), (4, "72h"), (5, "168h")]:
+        for sign in [-1, +1]:  # -1 = mean reversion, +1 = momentum
+            for scale in [0.001, 0.002, 0.003, 0.005, 0.008, 0.01, 0.015, 0.02]:
+                preds = sign * features[:, feat_idx] * scale
+                sharpe, max_dd, n_trades = _quick_backtest(preds, close)
+                # Only consider if enough trades and not catastrophic
+                if n_trades >= 30 and abs(max_dd) < 0.25:
+                    if sharpe > best_sharpe:
+                        best_sharpe = sharpe
+                        best_config = (feat_idx, name, sign, scale, sharpe, max_dd, n_trades)
 
-    for scale in np.arange(0.001, 0.030, 0.001):
-        for vol_thresh in np.arange(-1.0, 2.0, 0.25):
-            gate = 1.0 / (1.0 + np.exp((vol - vol_thresh) * 2.0))
-            preds = signal * scale * gate
+    if best_config:
+        feat_idx, name, sign, scale, sharpe, max_dd, n_trades = best_config
+        print(f"  Best single: {name} sign={sign:+d} scale={scale:.3f} "
+              f"sharpe={sharpe:.4f} dd={max_dd:.1%} trades={n_trades}")
+    else:
+        print("  No single feature achieves dd < 25%! Trying with relaxed constraint...")
+        # Try with relaxed drawdown
+        for feat_idx, name in [(0, "1h"), (1, "4h"), (2, "12h"), (3, "24h"), (4, "72h"), (5, "168h")]:
+            for sign in [-1, +1]:
+                for scale in [0.001, 0.002, 0.003, 0.005, 0.008, 0.01, 0.015, 0.02]:
+                    preds = sign * features[:, feat_idx] * scale
+                    sharpe, max_dd, n_trades = _quick_backtest(preds, close)
+                    if n_trades >= 30:
+                        # Score with drawdown penalty
+                        score = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
+                        if score > best_sharpe:
+                            best_sharpe = score
+                            best_config = (feat_idx, name, sign, scale, sharpe, max_dd, n_trades)
+        if best_config:
+            feat_idx, name, sign, scale, sharpe, max_dd, n_trades = best_config
+            print(f"  Best (relaxed): {name} sign={sign:+d} scale={scale:.3f} "
+                  f"sharpe={sharpe:.4f} dd={max_dd:.1%} trades={n_trades}")
 
-            positions = np.zeros_like(preds)
-            positions[preds > 0.005] = 1.0
-            positions[preds < -0.005] = -1.0
+    # Phase 2: Try vol gating on the best single signal
+    if best_config:
+        print("Phase 2: Adding vol gating to best signal...")
+        feat_idx_best = best_config[0]
+        sign_best = best_config[2]
+        best_gated_score = best_sharpe
+        best_gated = None
 
-            port_returns_arr = positions[:-1] * price_returns[1:]
+        for scale in [0.001, 0.002, 0.003, 0.005, 0.008, 0.01]:
+            for vol_thresh in np.arange(-1.5, 2.0, 0.25):
+                gate = 1.0 / (1.0 + np.exp((features[:, IDX_VOL24] - vol_thresh) * 3.0))
+                preds = sign_best * features[:, feat_idx_best] * scale * gate
+                sharpe, max_dd, n_trades = _quick_backtest(preds, close)
 
-            # Also compute max drawdown approximation
-            equity = np.cumprod(1.0 + port_returns_arr)
-            peak = np.maximum.accumulate(equity)
-            dd = (equity - peak) / peak
-            max_dd = np.min(dd)
+                if n_trades >= 30:
+                    if abs(max_dd) < 0.25:
+                        score = sharpe
+                    else:
+                        score = sharpe * 0.25 / abs(max_dd)
 
-            if np.std(port_returns_arr) > 0:
-                sharpe = np.mean(port_returns_arr) / np.std(port_returns_arr) * np.sqrt(8760)
-            else:
-                sharpe = 0
+                    if score > best_gated_score:
+                        best_gated_score = score
+                        best_gated = (scale, vol_thresh, sharpe, max_dd, n_trades)
 
-            n_trades_approx = np.sum(np.diff(positions) != 0)
+        if best_gated:
+            scale, vol_thresh, sharpe, max_dd, n_trades = best_gated
+            print(f"  Best gated: scale={scale:.3f} vol_thresh={vol_thresh:.2f} "
+                  f"sharpe={sharpe:.4f} dd={max_dd:.1%} trades={n_trades}")
 
-            # Score: Sharpe, but penalize if drawdown > 25% or < 30 trades
-            score = sharpe
-            if abs(max_dd) > 0.25:
-                score *= 0.25 / abs(max_dd)  # soft drawdown penalty
-            if n_trades_approx < 30:
-                score = -999
+            # Set model parameters
+            w = torch.zeros(6)
+            w[feat_idx_best] = sign_best * scale
+            with torch.no_grad():
+                model.weights.copy_(w)
+                model.vol_thresh.fill_(vol_thresh)
+        else:
+            print("  No improvement with gating, using ungated best")
+            w = torch.zeros(6)
+            w[best_config[0]] = best_config[2] * best_config[3]
+            with torch.no_grad():
+                model.weights.copy_(w)
+                model.vol_thresh.fill_(3.0)  # effectively no gating
 
-            if score > best_score:
-                best_score = score
-                best_scale = scale
-                best_vol_thresh = vol_thresh
-
-    print(f"  Best scale: {best_scale:.3f}, vol_thresh: {best_vol_thresh:.2f}, score: {best_score:.4f}")
-
-    # Set the parameters
-    with torch.no_grad():
-        model.scale.fill_(best_scale)
-        model.vol_threshold.fill_(best_vol_thresh)
-
-    # Also do gradient-based fine-tuning of the scale
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    loss_fn = nn.HuberLoss(delta=0.01)
-
-    print(f"Fine-tuning scale for up to {TIME_BUDGET}s...")
-    train_start = time.time()
-    epoch = 0
-
-    while time.time() - train_start < TIME_BUDGET:
-        epoch += 1
-        model.train()
-        pred = model(X_tensor)
-        loss = loss_fn(pred, y_tensor)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        if epoch % 500 == 0 or epoch == 1:
-            scale_val = model.scale.item()
-            elapsed = time.time() - train_start
-            print(f"  Epoch {epoch:4d} | loss={loss.item():.6f} | scale={scale_val:.6f} | {elapsed:.1f}s")
-
-        if time.time() - train_start >= TIME_BUDGET:
-            break
-
-    training_seconds = time.time() - train_start
-    print(f"Training complete: {epoch} epochs in {training_seconds:.1f}s")
-    print(f"  Final scale: {model.scale.item():.6f}")
+    training_seconds = time.time() - total_start
+    print(f"Search complete in {training_seconds:.1f}s")
 
     _trained_model = model
 
     # --- Evaluate on train split ---
     print("Evaluating on training data...")
     model.eval()
+    X_tensor = torch.tensor(features, dtype=torch.float32, device=device)
     with torch.no_grad():
         all_preds = model(X_tensor).cpu().numpy()
 
