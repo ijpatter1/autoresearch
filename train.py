@@ -305,7 +305,7 @@ def main():
                 sharpe, max_dd, n_trades = _quick_backtest(preds, close)
                 if n_trades >= 30:
                     proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
-                    if proxy > 0.05:  # only keep promising ones
+                    if proxy > -0.2:  # only keep promising ones
                         name = feature_names[feat_idx] if feat_idx < len(feature_names) else f"f{feat_idx}"
                         strategies.append((proxy, fn, f"{name} s={sign:+d} sc={scale:.4f}"))
 
@@ -325,7 +325,7 @@ def main():
                             sharpe, max_dd, n_trades = _quick_backtest(preds, close)
                             if n_trades >= 30:
                                 proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
-                                if proxy > 0.05:
+                                if proxy > -0.2:
                                     strategies.append((proxy, fn,
                                         f"f{i}*{si*sc_i:+.4f}+f{j}*{sj*sc_j:+.4f}"))
                                     pair_count += 1
@@ -342,7 +342,7 @@ def main():
                             sharpe, max_dd, n_trades = _quick_backtest(preds, close)
                             if n_trades >= 30:
                                 proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
-                                if proxy > 0.05:
+                                if proxy > -0.2:
                                     strategies.append((proxy, fn,
                                         f"f{ret_idx}*{sr*sc_r:+.4f}+rsi{rsi_idx}*{ss*sc_s:+.4f}"))
                                     pair_count += 1
@@ -356,14 +356,15 @@ def main():
     # -----------------------------------------------------------------------
     # Evaluate top strategies with actual evaluator on BOTH train and val
     # -----------------------------------------------------------------------
-    print(f"\nEvaluating top {min(200, len(strategies))} on train+val...")
+    n_eval = min(500, len(strategies))
+    print(f"\nEvaluating top {n_eval} on train+val...")
 
     best_score = -999
     best_fn = None
     best_desc = ""
     best_val_pass = False
 
-    for rank, (proxy, fn, desc) in enumerate(strategies[:200]):
+    for rank, (proxy, fn, desc) in enumerate(strategies[:n_eval]):
         # Train evaluation
         train_preds = fn(features)
         train_result = evaluate_model(train_preds, train_timestamps, n_params, split="train")
