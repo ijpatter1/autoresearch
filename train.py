@@ -347,6 +347,46 @@ def main():
                                         f"f{ret_idx}*{sr*sc_r:+.4f}+rsi{rsi_idx}*{ss*sc_s:+.4f}"))
                                     pair_count += 1
 
+    # Phase 4: Targeted search around val-passing strategies
+    # vol168 negative + any return feature combination
+    print("Phase 4: Vol168-based strategies (targeted for val_pass)...")
+    targeted_count = 0
+    for vol_scale in np.arange(0.0005, 0.010, 0.0005):
+        # Pure vol168 signal
+        fn = make_single_fn(7, -1, vol_scale)  # vol168 = feature 7
+        preds = fn(features)
+        sharpe, max_dd, n_trades = _quick_backtest(preds, close)
+        if n_trades >= 20:
+            proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
+            strategies.append((proxy, fn, f"vol168 s=-1 sc={vol_scale:.4f}"))
+            targeted_count += 1
+
+    # 24h MR + 168h momentum (val_pass found at f3*-0.002+f5*+0.003)
+    for mr_scale in np.arange(0.0005, 0.005, 0.0005):
+        for mom_scale in np.arange(0.0005, 0.005, 0.0005):
+            fn = make_pair_fn(3, 5, -1, mr_scale, +1, mom_scale)
+            preds = fn(features)
+            sharpe, max_dd, n_trades = _quick_backtest(preds, close)
+            if n_trades >= 20:
+                proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
+                strategies.append((proxy, fn,
+                    f"24hMR({mr_scale:.4f})+168hMOM({mom_scale:.4f})"))
+                targeted_count += 1
+
+    # Also try: 72h MR + 168h momentum (our best train combo + momentum)
+    for mr_scale in np.arange(0.0005, 0.005, 0.0005):
+        for mom_scale in np.arange(0.0005, 0.005, 0.0005):
+            fn = make_pair_fn(4, 5, -1, mr_scale, +1, mom_scale)
+            preds = fn(features)
+            sharpe, max_dd, n_trades = _quick_backtest(preds, close)
+            if n_trades >= 20:
+                proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
+                strategies.append((proxy, fn,
+                    f"72hMR({mr_scale:.4f})+168hMOM({mom_scale:.4f})"))
+                targeted_count += 1
+
+    print(f"  Targeted: {targeted_count} strategies")
+
     print(f"  Pairs: {pair_count} promising strategies")
     print(f"  Total: {len(strategies)}")
 
