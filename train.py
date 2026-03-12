@@ -387,6 +387,49 @@ def main():
 
     print(f"  Targeted: {targeted_count} strategies")
 
+    # Phase 5: Vol-gated versions of val-passing strategies
+    print("Phase 5: Vol-gated val-passing strategies...")
+    gated_count = 0
+    for mr_scale in np.arange(0.001, 0.005, 0.0005):
+        for mom_scale in np.arange(0.001, 0.005, 0.0005):
+            base_fn = make_pair_fn(3, 5, -1, mr_scale, +1, mom_scale)
+            for vol_thresh in np.arange(-1.5, 2.0, 0.25):
+                fn = make_gated_fn(base_fn, vol_thresh)
+                preds = fn(features)
+                sharpe, max_dd, n_trades = _quick_backtest(preds, close)
+                if n_trades >= 20:
+                    proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
+                    strategies.append((proxy, fn,
+                        f"GATED 24hMR({mr_scale:.4f})+168hMOM({mom_scale:.4f}) vt={vol_thresh:.2f}"))
+                    gated_count += 1
+
+    for mr_scale in np.arange(0.001, 0.005, 0.0005):
+        for mom_scale in np.arange(0.001, 0.005, 0.0005):
+            base_fn = make_pair_fn(4, 5, -1, mr_scale, +1, mom_scale)
+            for vol_thresh in np.arange(-1.5, 2.0, 0.25):
+                fn = make_gated_fn(base_fn, vol_thresh)
+                preds = fn(features)
+                sharpe, max_dd, n_trades = _quick_backtest(preds, close)
+                if n_trades >= 20:
+                    proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
+                    strategies.append((proxy, fn,
+                        f"GATED 72hMR({mr_scale:.4f})+168hMOM({mom_scale:.4f}) vt={vol_thresh:.2f}"))
+                    gated_count += 1
+
+    for vol_scale in np.arange(0.001, 0.010, 0.001):
+        base_fn = make_single_fn(7, -1, vol_scale)
+        for vol_thresh in np.arange(-1.5, 2.0, 0.25):
+            fn = make_gated_fn(base_fn, vol_thresh)
+            preds = fn(features)
+            sharpe, max_dd, n_trades = _quick_backtest(preds, close)
+            if n_trades >= 20:
+                proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
+                strategies.append((proxy, fn,
+                    f"GATED vol168({vol_scale:.4f}) vt={vol_thresh:.2f}"))
+                gated_count += 1
+
+    print(f"  Gated: {gated_count} strategies")
+
     print(f"  Pairs: {pair_count} promising strategies")
     print(f"  Total: {len(strategies)}")
 
