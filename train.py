@@ -163,12 +163,16 @@ def _normalize(features: np.ndarray, fit: bool = False) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 _trained_model: nn.Module | None = None
+_predict_fn = None  # numpy prediction function
 
 
 def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     features, timestamps = compute_features(df)
     features = _normalize(features, fit=False)
     features = np.nan_to_num(features, nan=0.0)
+
+    if _predict_fn is not None:
+        return _predict_fn(features), timestamps
 
     model = _trained_model
     if model is None:
@@ -357,12 +361,25 @@ def main():
 
     _trained_model = model
 
+    # --- Store best config for numpy prediction ---
+    _best_feat_idx = best_config[0] if best_config else 4
+    _best_sign = best_config[2] if best_config else -1
+    _best_scale = best_gated[0] if best_gated else (best_config[3] if best_config else 0.002)
+    _best_vol_thresh_np = best_gated[1] if best_gated else 3.0
+
+    global _predict_fn
+
+    def _predict_numpy(feats):
+        """Compute predictions in float64 numpy to match grid search exactly."""
+        signal = _best_sign * feats[:, _best_feat_idx] * _best_scale
+        gate = 1.0 / (1.0 + np.exp((feats[:, IDX_VOL24] - _best_vol_thresh_np) * 3.0))
+        return signal * gate
+
+    _predict_fn = _predict_numpy
+
     # --- Evaluate on train split ---
     print("Evaluating on training data...")
-    model.eval()
-    X_tensor = torch.tensor(features, dtype=torch.float32, device=device)
-    with torch.no_grad():
-        all_preds = model(X_tensor).cpu().numpy()
+    all_preds = _predict_numpy(features)
 
     print(f"  Pred stats: mean={np.mean(all_preds):.6f}, std={np.std(all_preds):.6f}")
     print(f"  Preds > 0.005: {np.sum(all_preds > 0.005)}, Preds < -0.005: {np.sum(all_preds < -0.005)}")
@@ -376,9 +393,7 @@ def main():
     val_features = _normalize(val_features, fit=False)
     val_features = np.nan_to_num(val_features, nan=0.0)
 
-    with torch.no_grad():
-        X_val = torch.tensor(val_features, dtype=torch.float32, device=device)
-        val_preds = model(X_val).cpu().numpy()
+    val_preds = _predict_numpy(val_features)
 
     val_result = evaluate_model(val_preds, val_timestamps, n_params, split="val")
 
