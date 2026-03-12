@@ -100,37 +100,24 @@ def compute_targets(df: pd.DataFrame) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Model — Multiple mean-reversion signals with vol gating
+# Model
 # ---------------------------------------------------------------------------
 
 N_FEATURES = len(RETURN_LOOKBACKS) + len(VOLATILITY_WINDOWS) + 1 + 2 + 2 + 1  # 14
 
-# Feature indices
-IDX_1H = 0; IDX_4H = 1; IDX_12H = 2; IDX_24H = 3; IDX_72H = 4; IDX_168H = 5
-IDX_VOL24 = 6; IDX_VOL168 = 7
+IDX_VOL24 = 6
 
 
 class ForwardReturnModel(nn.Module):
-    """Multi-signal mean reversion with volatility gating.
-
-    Combines mean-reversion signals from multiple timeframes.
-    No gradient training — parameters set via grid search.
-    """
+    """Dummy model — predictions computed in numpy, this is for API compat."""
 
     def __init__(self, n_features: int = N_FEATURES):
         super().__init__()
-        # Weights for each return lookback (negative = mean reversion)
-        self.weights = nn.Parameter(torch.zeros(6))  # one per return lookback
-        self.vol_thresh = nn.Parameter(torch.tensor(0.0))
+        self.linear = nn.Linear(n_features, 1)
         self._n_features = n_features
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Weighted combination of return features (indices 0-5)
-        signal = (x[:, :6] * self.weights.unsqueeze(0)).sum(dim=1)
-        # Vol gate
-        vol = x[:, IDX_VOL24]
-        gate = torch.sigmoid(-(vol - self.vol_thresh) * 3.0)
-        return signal * gate
+        return self.linear(x).squeeze(-1)
 
 
 def count_model_params(model: nn.Module | None = None) -> int:
@@ -163,7 +150,7 @@ def _normalize(features: np.ndarray, fit: bool = False) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 _trained_model: nn.Module | None = None
-_predict_fn = None  # numpy prediction function
+_predict_fn = None
 
 
 def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
@@ -188,10 +175,10 @@ def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
-# Backtest proxy (fast, fee-adjusted)
+# Quick backtest (fee-adjusted)
 # ---------------------------------------------------------------------------
 
-FEE = 0.001 + 0.0005  # fee + slippage per side
+FEE = 0.001 + 0.0005
 
 
 def _quick_backtest(preds, close, threshold=0.005):
@@ -231,11 +218,11 @@ def _quick_backtest(preds, close, threshold=0.005):
 
 
 # ---------------------------------------------------------------------------
-# Main Training Loop
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
-    global _trained_model
+    global _trained_model, _predict_fn
 
     total_start = time.time()
 
@@ -252,7 +239,6 @@ def main():
     train_df = load_train_data()
     print(f"  {len(train_df)} rows")
 
-    # --- Compute features and targets ---
     features, timestamps = compute_features(train_df)
     targets = compute_targets(train_df)
     targets = targets[MAX_LOOKBACK:]
@@ -267,194 +253,163 @@ def main():
 
     close = train_df["close"].values[MAX_LOOKBACK:][valid]
 
-    print(f"  Training samples: {len(features)}, Features: {features.shape[1]}")
+    # Load val data
+    val_df = load_val_data()
+    val_features, val_timestamps = compute_features(val_df)
+    val_features = _normalize(val_features, fit=False)
+    val_features = np.nan_to_num(val_features, nan=0.0)
 
-    # --- Setup model ---
+    print(f"  Training samples: {len(features)}, Features: {features.shape[1]}")
+    print(f"  Val samples: {len(val_features)}")
+
     model = ForwardReturnModel(n_features=features.shape[1]).to(device)
     n_params = count_model_params(model)
-    print(f"  Model parameters: {n_params}")
 
-    # --- Comprehensive grid search ---
-    # Use actual evaluate_model to score top candidates (slower but accurate)
-    print("Phase 1: Single feature scan...")
-    candidates = []  # list of (proxy_score, feat_idx, sign, scale, vol_thresh)
-    scales = np.arange(0.001, 0.020, 0.0005)
+    # -----------------------------------------------------------------------
+    # Strategy search: jointly optimize for train score AND val_pass
+    # -----------------------------------------------------------------------
 
-    for feat_idx in range(6):
+    def make_single_fn(fi, s, sc):
+        def fn(feats):
+            return s * feats[:, fi] * sc
+        return fn
+
+    def make_pair_fn(fi, fj, si, sc_i, sj, sc_j):
+        def fn(feats):
+            return si * feats[:, fi] * sc_i + sj * feats[:, fj] * sc_j
+        return fn
+
+    def make_gated_fn(base_fn, vol_thresh):
+        def fn(feats):
+            base = base_fn(feats)
+            gate = 1.0 / (1.0 + np.exp((feats[:, IDX_VOL24] - vol_thresh) * 3.0))
+            return base * gate
+        return fn
+
+    # Collect all strategies with their prediction functions
+    strategies = []  # (proxy_train_score, pred_fn, desc)
+
+    print("Generating strategies...")
+
+    # Single features: all lookbacks, RSI, both signs
+    feature_names = ["1h", "4h", "12h", "24h", "72h", "168h",
+                     "vol24", "vol168", "volratio", "sin_h", "cos_h",
+                     "rsi14", "rsi48", "hl24"]
+    scales = np.arange(0.0005, 0.020, 0.0005)
+
+    for feat_idx in range(features.shape[1]):
         for sign in [-1, +1]:
             for scale in scales:
-                preds = sign * features[:, feat_idx] * scale
+                fn = make_single_fn(feat_idx, sign, scale)
+                preds = fn(features)
                 sharpe, max_dd, n_trades = _quick_backtest(preds, close)
                 if n_trades >= 30:
-                    score = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
-                    candidates.append((score, feat_idx, sign, scale, 3.0))  # 3.0 = no gating
+                    proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
+                    if proxy > 0.05:  # only keep promising ones
+                        name = feature_names[feat_idx] if feat_idx < len(feature_names) else f"f{feat_idx}"
+                        strategies.append((proxy, fn, f"{name} s={sign:+d} sc={scale:.4f}"))
 
-    # Phase 1b: Vol gating on top single features
-    print("Phase 2: Vol gating on top candidates...")
-    top_singles = sorted(candidates, reverse=True)[:10]  # top 10 singles
-    for _, feat_idx, sign, scale, _ in top_singles:
-        for vol_thresh in np.arange(-1.0, 2.5, 0.25):
-            gate = 1.0 / (1.0 + np.exp((features[:, IDX_VOL24] - vol_thresh) * 3.0))
-            preds = sign * features[:, feat_idx] * scale * gate
-            sharpe, max_dd, n_trades = _quick_backtest(preds, close)
-            if n_trades >= 30:
-                score = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
-                candidates.append((score, feat_idx, sign, scale, vol_thresh))
+    print(f"  Single features: {len(strategies)} promising strategies")
 
-    # Phase 2: Two-feature combinations
-    print("Phase 3: Two-feature combinations...")
+    # Pairs: return features (0-5) x return features, and return x RSI
     combo_scales = [0.001, 0.0015, 0.002, 0.003, 0.005]
+    pair_count = 0
     for i in range(6):
         for j in range(i + 1, 6):
             for si in [-1, +1]:
                 for sj in [-1, +1]:
                     for sc_i in combo_scales:
                         for sc_j in combo_scales:
-                            preds = si * features[:, i] * sc_i + sj * features[:, j] * sc_j
+                            fn = make_pair_fn(i, j, si, sc_i, sj, sc_j)
+                            preds = fn(features)
                             sharpe, max_dd, n_trades = _quick_backtest(preds, close)
                             if n_trades >= 30:
-                                score = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
-                                candidates.append((score, -(i * 10 + j), si, sc_i, sj * sc_j))
+                                proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
+                                if proxy > 0.05:
+                                    strategies.append((proxy, fn,
+                                        f"f{i}*{si*sc_i:+.4f}+f{j}*{sj*sc_j:+.4f}"))
+                                    pair_count += 1
 
-    # Phase 3b: Explicit MR+momentum and pure momentum strategies
-    print("Phase 3b: MR+momentum and pure momentum combos...")
-    for mr_idx in [1, 2, 3, 4]:
-        for mom_idx in [4, 5]:
-            if mr_idx == mom_idx:
-                continue
-            for mr_scale in [0.001, 0.0015, 0.002, 0.003]:
-                for mom_scale in [0.0005, 0.001, 0.0015, 0.002, 0.003]:
-                    preds = -features[:, mr_idx] * mr_scale + features[:, mom_idx] * mom_scale
-                    sharpe, max_dd, n_trades = _quick_backtest(preds, close)
-                    if n_trades >= 30:
-                        score = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
-                        candidates.append((score, -(mr_idx * 10 + mom_idx), -1, mr_scale, mom_scale))
+    # Return feature + RSI combos
+    for ret_idx in range(6):
+        for rsi_idx in [12, 13]:
+            for sr in [-1, +1]:
+                for ss in [-1, +1]:
+                    for sc_r in combo_scales:
+                        for sc_s in combo_scales:
+                            fn = make_pair_fn(ret_idx, rsi_idx, sr, sc_r, ss, sc_s)
+                            preds = fn(features)
+                            sharpe, max_dd, n_trades = _quick_backtest(preds, close)
+                            if n_trades >= 30:
+                                proxy = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
+                                if proxy > 0.05:
+                                    strategies.append((proxy, fn,
+                                        f"f{ret_idx}*{sr*sc_r:+.4f}+rsi{rsi_idx}*{ss*sc_s:+.4f}"))
+                                    pair_count += 1
 
-    # Phase 3c: RSI-based and volatility-based signals
-    print("Phase 3c: RSI and vol-based signals...")
-    # RSI features are at indices 12 (RSI-14) and 13 (RSI-48)
-    # They're normalized to [0,1] then z-scored. RSI > 0.7 = overbought (sell), < 0.3 = oversold (buy)
-    # So mean-reversion on RSI: negative weight (high RSI → go short)
-    for rsi_idx in [12, 13]:
-        for scale in [0.001, 0.002, 0.003, 0.005, 0.008]:
-            for sign in [-1, +1]:
-                preds = sign * features[:, rsi_idx] * scale
-                sharpe, max_dd, n_trades = _quick_backtest(preds, close)
-                if n_trades >= 30:
-                    score = sharpe * min(1.0, 0.25 / max(abs(max_dd), 0.01))
-                    candidates.append((score, rsi_idx, sign, scale, 3.0))
+    print(f"  Pairs: {pair_count} promising strategies")
+    print(f"  Total: {len(strategies)}")
 
-    # Sort and pick the best
-    candidates.sort(reverse=True)
-    print(f"  Total candidates: {len(candidates)}")
-    print(f"  Top 5 proxy scores: {[f'{c[0]:.4f}' for c in candidates[:5]]}")
+    # Sort by proxy score
+    strategies.sort(reverse=True, key=lambda x: x[0])
 
-    # Now use evaluate_model on top candidates to find the actual best
-    print("Phase 4: Verifying top candidates with actual evaluator...")
-    best_actual_score = -999
-    best_predict_fn = None
-    best_actual_desc = ""
+    # -----------------------------------------------------------------------
+    # Evaluate top strategies with actual evaluator on BOTH train and val
+    # -----------------------------------------------------------------------
+    print(f"\nEvaluating top {min(200, len(strategies))} on train+val...")
 
-    # Load val data early for cross-checking
-    val_df_early = load_val_data()
-    val_features_early, val_timestamps_early = compute_features(val_df_early)
-    val_features_early = _normalize(val_features_early, fit=False)
-    val_features_early = np.nan_to_num(val_features_early, nan=0.0)
+    best_score = -999
+    best_fn = None
+    best_desc = ""
+    best_val_pass = False
 
-    for rank, cand in enumerate(candidates[:100]):
-        proxy_score, feat_id, sign, scale, extra = cand
+    for rank, (proxy, fn, desc) in enumerate(strategies[:200]):
+        # Train evaluation
+        train_preds = fn(features)
+        train_result = evaluate_model(train_preds, train_timestamps, n_params, split="train")
+        train_score = train_result["score"]
 
-        if feat_id >= 0:
-            # Single feature
-            vol_thresh = extra
+        # Val evaluation
+        val_preds = fn(val_features)
+        val_result = evaluate_model(val_preds, val_timestamps, n_params, split="val")
+        vp = val_result["val_pass"]
 
-            def make_fn(fi, s, sc, vt):
-                def fn(feats):
-                    sig = s * feats[:, fi] * sc
-                    if vt < 2.5:
-                        gate = 1.0 / (1.0 + np.exp((feats[:, IDX_VOL24] - vt) * 3.0))
-                        return sig * gate
-                    return sig
-                return fn
-
-            pred_fn = make_fn(feat_id, sign, scale, vol_thresh)
-            desc = f"feat{feat_id} s={sign:+d} sc={scale:.4f} vt={vol_thresh:.2f}"
-        else:
-            # Two features
-            i = (-feat_id) // 10
-            j = (-feat_id) % 10
-            sc_j = extra  # sign * scale for j
-
-            def make_fn2(fi, fj, si, sc_i, sc_j_val):
-                def fn(feats):
-                    return si * feats[:, fi] * sc_i + feats[:, fj] * sc_j_val
-                return fn
-
-            pred_fn = make_fn2(i, j, sign, scale, sc_j)
-            desc = f"feat{i}+feat{j}"
-
-        train_preds = pred_fn(features)
-        result = evaluate_model(train_preds, train_timestamps, n_params, split="train")
-        actual_score = result["score"]
-
-        # Also check validation
-        val_preds_check = pred_fn(val_features_early)
-        val_result_check = evaluate_model(val_preds_check, val_timestamps_early, n_params, split="val")
-        vp = val_result_check["val_pass"]
-
-        # Prefer: val_pass AND highest score. If no val_pass found, use highest score.
+        # Selection: prefer val_pass=true with highest train score
         is_better = False
-        if vp and actual_score > 0:
-            # val_pass is true — this is strictly better if score > 0
-            if not getattr(main, '_best_val_pass', False) or actual_score > best_actual_score:
+        if vp and train_score > 0:
+            if not best_val_pass or train_score > best_score:
                 is_better = True
-                main._best_val_pass = True
-        elif not getattr(main, '_best_val_pass', False) and actual_score > best_actual_score:
+        elif not best_val_pass and train_score > best_score:
             is_better = True
 
         if is_better:
-            best_actual_score = actual_score
-            best_predict_fn = pred_fn
-            best_actual_desc = desc
+            best_score = train_score
+            best_fn = fn
+            best_desc = desc
+            best_val_pass = vp
 
-        if actual_score > 0 or vp:
-            print(f"  #{rank}: {desc} proxy={proxy_score:.4f} actual={actual_score:.4f} "
-                  f"sharpe={result['sharpe']:.4f} dd={result['max_drawdown']:.1%} "
-                  f"trades={result['n_trades']} val_pass={vp}")
+        if vp or train_score > 0.5:
+            print(f"  #{rank}: {desc} train={train_score:.4f} "
+                  f"sharpe={train_result['sharpe']:.4f} dd={train_result['max_drawdown']:.1%} "
+                  f"trades={train_result['n_trades']} val_pass={vp}")
 
-    training_seconds = time.time() - total_start
-    print(f"\n  Best actual: {best_actual_desc} score={best_actual_score:.4f}")
+    print(f"\nBest: {best_desc} score={best_score:.4f} val_pass={best_val_pass}")
 
-    global _predict_fn
-    _predict_fn = best_predict_fn
+    _predict_fn = best_fn
     _trained_model = model
 
     training_seconds = time.time() - total_start
     print(f"Search complete in {training_seconds:.1f}s")
 
-    # --- Evaluate on train split using actual best ---
-    print("Evaluating on training data...")
-    all_preds = best_predict_fn(features)
-
-    print(f"  Pred stats: mean={np.mean(all_preds):.6f}, std={np.std(all_preds):.6f}")
-    print(f"  Preds > 0.005: {np.sum(all_preds > 0.005)}, Preds < -0.005: {np.sum(all_preds < -0.005)}")
-
+    # --- Final evaluation ---
+    all_preds = best_fn(features)
     train_result = evaluate_model(all_preds, train_timestamps, n_params, split="train")
 
-    # --- Evaluate on validation split ---
-    print("Evaluating on validation data...")
-    val_df = load_val_data()
-    val_features, val_timestamps = compute_features(val_df)
-    val_features = _normalize(val_features, fit=False)
-    val_features = np.nan_to_num(val_features, nan=0.0)
-
-    val_preds = best_predict_fn(val_features)
-
+    val_preds = best_fn(val_features)
     val_result = evaluate_model(val_preds, val_timestamps, n_params, split="val")
 
     total_seconds = time.time() - total_start
 
-    # --- Print summary ---
     print()
     print("---")
     print(f"score:            {train_result['score']:.4f}")
