@@ -328,7 +328,13 @@ def main():
     best_predict_fn = None
     best_actual_desc = ""
 
-    for rank, cand in enumerate(candidates[:20]):
+    # Load val data early for cross-checking
+    val_df_early = load_val_data()
+    val_features_early, val_timestamps_early = compute_features(val_df_early)
+    val_features_early = _normalize(val_features_early, fit=False)
+    val_features_early = np.nan_to_num(val_features_early, nan=0.0)
+
+    for rank, cand in enumerate(candidates[:30]):
         proxy_score, feat_id, sign, scale, extra = cand
 
         if feat_id >= 0:
@@ -364,12 +370,30 @@ def main():
         result = evaluate_model(train_preds, train_timestamps, n_params, split="train")
         actual_score = result["score"]
 
-        if actual_score > best_actual_score:
+        # Also check validation
+        val_preds_check = pred_fn(val_features_early)
+        val_result_check = evaluate_model(val_preds_check, val_timestamps_early, n_params, split="val")
+        vp = val_result_check["val_pass"]
+
+        # Prefer: val_pass AND highest score. If no val_pass found, use highest score.
+        is_better = False
+        if vp and actual_score > 0:
+            # val_pass is true — this is strictly better if score > 0
+            if not getattr(main, '_best_val_pass', False) or actual_score > best_actual_score:
+                is_better = True
+                main._best_val_pass = True
+        elif not getattr(main, '_best_val_pass', False) and actual_score > best_actual_score:
+            is_better = True
+
+        if is_better:
             best_actual_score = actual_score
             best_predict_fn = pred_fn
             best_actual_desc = desc
+
+        if actual_score > 0 or vp:
             print(f"  #{rank}: {desc} proxy={proxy_score:.4f} actual={actual_score:.4f} "
-                  f"sharpe={result['sharpe']:.4f} dd={result['max_drawdown']:.1%} trades={result['n_trades']}")
+                  f"sharpe={result['sharpe']:.4f} dd={result['max_drawdown']:.1%} "
+                  f"trades={result['n_trades']} val_pass={vp}")
 
     training_seconds = time.time() - total_start
     print(f"\n  Best actual: {best_actual_desc} score={best_actual_score:.4f}")
