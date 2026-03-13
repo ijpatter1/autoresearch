@@ -28,6 +28,7 @@ VOLATILITY_WINDOWS = [24, 168]
 TREND_MA_WINDOWS = [24, 72, 168]
 ZSCORE_WINDOWS = [72, 168]
 MAX_LOOKBACK = 168  # maximum lookback window (1 week)
+PRED_SCALE = 5.0  # scale up conservative GBR predictions
 
 
 def compute_vol_168(df: pd.DataFrame) -> np.ndarray:
@@ -198,7 +199,7 @@ def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     if model is None:
         raise RuntimeError("Model not trained. Run train.py first.")
 
-    preds = model.predict(features)
+    preds = model.predict(features) * PRED_SCALE
     preds = _apply_regime_filter(preds, df)
     return preds, timestamps
 
@@ -261,7 +262,7 @@ def main():
 
     # --- Evaluate on train split ---
     print("Evaluating on training data...")
-    all_preds = model.predict(features)
+    all_preds = model.predict(features) * PRED_SCALE
     all_preds = _apply_regime_filter(all_preds, train_df)
 
     train_result = evaluate_model(all_preds, train_timestamps, n_params, split="train")
@@ -272,10 +273,17 @@ def main():
     val_features, val_timestamps = compute_features(val_df)
     val_features = np.nan_to_num(val_features, nan=0.0)
 
-    val_preds = model.predict(val_features)
+    val_preds = model.predict(val_features) * PRED_SCALE
+
+    # Debug: raw predictions before regime filter
+    print(f"  Val RAW preds: pos={np.sum(val_preds > 0)}, neg={np.sum(val_preds < 0)}")
+    print(f"  Val RAW range: [{val_preds.min():.6f}, {val_preds.max():.6f}]")
+    print(f"  Val RAW mean: {val_preds.mean():.6f}, std: {val_preds.std():.6f}")
+    print(f"  Val RAW >0.005: {np.sum(val_preds > 0.005)}, <-0.005: {np.sum(val_preds < -0.005)}")
+
     val_preds = _apply_regime_filter(val_preds, val_df)
 
-    # Debug: print val prediction statistics
+    # Debug: print val prediction statistics after filter
     above_thresh = np.sum(val_preds > 0.005)
     below_thresh = np.sum(val_preds < -0.005)
     flat = np.sum(np.abs(val_preds) <= 0.005)
