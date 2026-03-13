@@ -1,1 +1,19 @@
 commit	score	sharpe	max_dd	n_trades	n_params	val_pass	status	description
+e39f137	0.0000	1.5941	-33.2	1174	6520	false	discard	GBR 500 trees depth 3
+6fea1df	0.0000	1.2652	-33.6	408	2050	false	discard	GBR depth 2 300 trees min_leaf 100
+d65a3b5	0.0000	1.3469	-32.9	129	1284	false	discard	GBR lr=0.005 200 trees min_leaf 200
+ce11f3a	0.0000	1.4949	-34.5	716	3712	false	discard	GBR no winsorize + crash detector + HL range
+750ef23	0.0000	1.4427	-32.6	364	3724	false	discard	GBR + vol dampening
+e7b8886	1.6176	1.7357	-15.7	302	3650	false	discard	GBR + vol dampen + crash regime filter
+0daf0b0	0.9847	1.0580	-23.1	369	3722	false	discard	crash threshold -20%
+a087468	0.0000	0.9716	-11.7	19	1238	false	discard	GBR depth 2 200 trees subsample 0.6 (only 19 trades)
+031dd23	1.6081	1.7286	-18.9	511	3748	false	discard	GBR depth 3 + gentler vol dampen + crash filter
+65576d0	1.3597	1.4547	-22.0	464	3492	false	discard	GBR + price-rel-MA instead of z-scores
+3adcafe	0.0000	1.0746	-28.9	376	3254	false	discard	GBR trained on 2021-2022 only
+adac4d6	1.2325	1.3221	-18.4	642	3636	false	discard	GBR + bull/crash filter + z-scores + MA
+d5ca061	0.0000	-0.7060	-83.6	1513	19	false	discard	Ridge regression (negative Sharpe)
+86735c1	0.0000	0.9608	-8.1	17	277	false	discard	GBR no normalize + early stopping (only 17 trades)
+f73d12c	1.4548	1.6870	-14.7	450	7982	false	discard	GBR+RF ensemble (still val_pass false)
+1769d1c	0.7432	0.7957	-18.2	310	3532	false	discard	long-only GBR (fixed normalization)
+0e5b15e	1.2871	1.3682	-22.3	452	3150	true	keep	1.2x + squared_error + random_state=42 + no normalize
+6df4c34	1.4031	1.4931	-18.8	455	3206	true	keep	DOW cyclical + momentum accel features
