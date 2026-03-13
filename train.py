@@ -102,7 +102,18 @@ def compute_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     hl_range_24 = pd.Series(hl_range).rolling(24, min_periods=24).mean().values
     feature_cols.append(hl_range_24)
 
-    # 7. Momentum acceleration: 24h return - 72h return (trend strengthening?)
+    # 7. Hour of day (cyclical)
+    dt = pd.to_datetime(ts)
+    hours = dt.hour
+    feature_cols.append(np.sin(2 * np.pi * hours / 24))
+    feature_cols.append(np.cos(2 * np.pi * hours / 24))
+
+    # 8. Day of week (cyclical) — crypto has weekly patterns
+    dow = dt.dayofweek
+    feature_cols.append(np.sin(2 * np.pi * dow / 7))
+    feature_cols.append(np.cos(2 * np.pi * dow / 7))
+
+    # 9. Momentum acceleration: 24h return - 72h return (trend strengthening?)
     ret_24 = np.full(len(close), np.nan)
     ret_24[24:] = close[24:] / close[:-24] - 1.0
     ret_72 = np.full(len(close), np.nan)
@@ -257,7 +268,11 @@ def main():
         loss="squared_error",
         random_state=42,
     )
-    model.fit(features, targets)
+    # Exponential sample weights: half-life ~2 years (17520 hours)
+    n_samples = len(features)
+    decay = np.exp(np.linspace(-n_samples / 17520, 0, n_samples))
+    sample_weights = decay / decay.mean()  # normalize to mean=1
+    model.fit(features, targets, sample_weight=sample_weights)
 
     training_seconds = time.time() - train_start
     print(f"Training complete in {training_seconds:.1f}s")
