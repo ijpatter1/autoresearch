@@ -192,7 +192,6 @@ def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     """Generate predictions on arbitrary OHLCV data."""
     features, timestamps = compute_features(df)
     vol = compute_vol_168(df)
-    features = _normalize(features, fit=False)
     features = np.nan_to_num(features, nan=0.0)
 
     model = _trained_model
@@ -231,8 +230,8 @@ def main():
     targets = targets[valid]
     train_timestamps = timestamps[valid]
 
-    # Normalize features (for consistent train/val distributions)
-    features = _normalize(features, fit=True)
+    # GBR is invariant to feature scaling — skip normalization to avoid
+    # distribution mismatch between train/val periods.
     features = np.nan_to_num(features, nan=0.0)
 
     print(f"  Training samples: {len(features)}, Features: {features.shape[1]}")
@@ -271,7 +270,6 @@ def main():
     print("Evaluating on validation data...")
     val_df = load_val_data()
     val_features, val_timestamps = compute_features(val_df)
-    val_features = _normalize(val_features, fit=False)
     val_features = np.nan_to_num(val_features, nan=0.0)
 
     val_preds = model.predict(val_features)
