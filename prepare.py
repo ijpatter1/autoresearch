@@ -308,35 +308,62 @@ def _backtest(predictions: np.ndarray, close_prices: np.ndarray,
 
 
 def _compute_score(sharpe: float, max_drawdown: float, n_trades: int,
-                   subperiod_returns: list, n_params: int,
-                   min_subperiods_profitable: int) -> float:
-    """Compute composite score with penalty multiplier.
+                   subperiod_returns: list, n_params: int) -> float:
+    """Compute composite score with soft continuous penalties.
 
-    score = sharpe_ratio * penalty_multiplier
+    score = sharpe * dd_mult * trade_mult * consistency * param_mult
 
-    penalty_multiplier is 0.0 if:
-      - n_trades < 30
-      - |max_drawdown| > 25%
-      - fewer than min_subperiods_profitable subperiods are profitable
+    All penalties are continuous — no hard cliffs. Every experiment
+    produces a meaningful signal for the agent to learn from.
 
-    Soft penalty for model complexity:
-      penalty_multiplier *= 1 / (1 + 0.02 * n_params_thousands)
+    Components:
+      - sharpe: base metric (annualized Sharpe ratio)
+      - dd_mult: soft drawdown penalty, full credit up to 10%,
+        quadratic degradation beyond (20% dd -> 0.69x, 30% -> 0.36x)
+      - trade_mult: linear ramp to 1.0 at 50 trades
+      - consistency: fraction of subperiods that are profitable
+      - param_mult: gentle complexity penalty
     """
-    penalty = 1.0
+    # If Sharpe is zero or negative, score is zero —
+    # no amount of penalty shaping helps a losing strategy.
+    if sharpe <= 0:
+        return 0.0
 
-    if n_trades < 30:
-        penalty = 0.0
-    if abs(max_drawdown) > 0.25:
-        penalty = 0.0
+    # --- Drawdown: soft quadratic penalty ---
+    # Full credit up to 10% drawdown, then smooth degradation.
+    # 15% dd -> 0.92x, 20% -> 0.69x, 25% -> 0.50x,
+    # 30% -> 0.36x, 40% -> 0.20x, 50% -> 0.12x
+    dd = abs(max_drawdown)
+    if dd <= 0.10:
+        dd_mult = 1.0
+    else:
+        dd_mult = 1.0 / (1.0 + ((dd - 0.10) / 0.15) ** 2)
 
-    profitable_periods = sum(1 for r in subperiod_returns if r > 0)
-    if profitable_periods < min_subperiods_profitable:
-        penalty = 0.0
+    # --- Trade count: linear ramp, no hard cutoff ---
+    # 10 trades -> 0.2x, 25 -> 0.5x, 50+ -> 1.0x
+    # Still discourages degenerate low-trade strategies,
+    # but doesn't zero them out.
+    trade_mult = min(1.0, n_trades / 50.0)
 
+    # --- Consistency: proportion of profitable subperiods ---
+    # 3/3 -> 1.0, 2/3 -> 0.67, 1/3 -> 0.33, 0/3 -> 0.0
+    n_profitable = sum(1 for r in subperiod_returns if r > 0)
+    n_periods = len(subperiod_returns)
+    if n_periods > 0:
+        consistency = n_profitable / n_periods
+    else:
+        consistency = 0.0
+
+    # --- Parameter count: gentle complexity penalty ---
+    # 1K params -> 0.99x, 10K -> 0.91x, 50K -> 0.67x, 100K -> 0.50x
+    # Halved vs original (0.01 instead of 0.02) so that ML models
+    # can compete on roughly equal footing with simpler approaches.
     n_params_k = n_params / 1000.0
-    penalty *= 1.0 / (1.0 + 0.02 * n_params_k)
+    param_mult = 1.0 / (1.0 + 0.01 * n_params_k)
 
-    return sharpe * penalty
+    score = sharpe * dd_mult * trade_mult * consistency * param_mult
+
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -370,18 +397,15 @@ def evaluate_model(predictions: np.ndarray, timestamps: np.ndarray,
     if split == "train":
         mask = (all_data["timestamp"] >= TRAIN_START) & (all_data["timestamp"] <= TRAIN_END)
         subperiods = TRAIN_SUBPERIODS
-        min_profitable = 2
     elif split == "val":
         mask = (all_data["timestamp"] >= VAL_START) & (all_data["timestamp"] <= VAL_END)
         subperiods = VAL_SUBPERIODS
-        min_profitable = len(VAL_SUBPERIODS)
     elif split == "holdout":
         mask = (all_data["timestamp"] >= HOLDOUT_START) & (all_data["timestamp"] <= HOLDOUT_END)
         subperiods = [
             (pd.Timestamp("2024-07-01"), pd.Timestamp("2024-12-31 23:00:00")),
             (pd.Timestamp("2025-01-01"), pd.Timestamp("2025-12-31 23:00:00")),
         ]
-        min_profitable = len(subperiods)
     else:
         raise ValueError(f"split must be 'train', 'val', or 'holdout', got '{split}'")
 
@@ -412,7 +436,6 @@ def evaluate_model(predictions: np.ndarray, timestamps: np.ndarray,
         n_trades=bt["n_trades"],
         subperiod_returns=bt["subperiod_returns"],
         n_params=n_params,
-        min_subperiods_profitable=min_profitable,
     )
 
     if split == "train":
