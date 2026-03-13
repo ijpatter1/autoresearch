@@ -28,7 +28,7 @@ VOLATILITY_WINDOWS = [24, 168]
 TREND_MA_WINDOWS = [24, 72, 168]
 ZSCORE_WINDOWS = [72, 168]
 MAX_LOOKBACK = 168  # maximum lookback window (1 week)
-PRED_SCALE = 5.0  # scale up conservative GBR predictions
+PRED_SCALE = 2.0  # scale up conservative GBR predictions
 
 
 def compute_vol_168(df: pd.DataFrame) -> np.ndarray:
@@ -248,8 +248,7 @@ def main():
         subsample=0.8,
         min_samples_leaf=100,
         max_features=0.8,
-        loss="huber",
-        alpha=0.9,
+        loss="squared_error",
     )
     model.fit(features, targets)
 
