@@ -28,7 +28,7 @@ VOLATILITY_WINDOWS = [24, 168]
 TREND_MA_WINDOWS = [24, 72, 168]
 ZSCORE_WINDOWS = [72, 168]
 MAX_LOOKBACK = 168  # maximum lookback window (1 week)
-PRED_SCALE = 1.2  # compensate for lower learning rate
+PRED_SCALE = 0.8  # very selective — highest confidence trades only
 
 
 def compute_vol_168(df: pd.DataFrame) -> np.ndarray:
@@ -245,8 +245,8 @@ def main():
     targets = targets[valid]
     train_timestamps = timestamps[valid]
 
-    # Winsorize targets at ±5% to reduce influence of extreme returns
-    targets = np.clip(targets, -0.05, 0.05)
+    # Winsorize targets at ±3% to reduce influence of extreme returns
+    targets = np.clip(targets, -0.03, 0.03)
 
     # GBR is invariant to feature scaling — skip normalization to avoid
     # distribution mismatch between train/val periods.
@@ -259,9 +259,9 @@ def main():
     train_start = time.time()
 
     model = GradientBoostingRegressor(
-        n_estimators=600,
+        n_estimators=300,
         max_depth=3,
-        learning_rate=0.005,
+        learning_rate=0.01,
         subsample=0.8,
         min_samples_leaf=100,
         max_features=0.8,
