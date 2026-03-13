@@ -28,7 +28,7 @@ VOLATILITY_WINDOWS = [24, 168]
 TREND_MA_WINDOWS = [24, 72, 168]
 ZSCORE_WINDOWS = [72, 168]
 MAX_LOOKBACK = 168  # maximum lookback window (1 week)
-PRED_SCALE = 0.9  # selective but more trades than 0.8
+PRED_SCALE = 0.8  # very selective — highest confidence trades only
 
 
 def compute_vol_168(df: pd.DataFrame) -> np.ndarray:
@@ -259,7 +259,7 @@ def main():
     train_start = time.time()
 
     model = GradientBoostingRegressor(
-        n_estimators=300,
+        n_estimators=500,
         max_depth=3,
         learning_rate=0.01,
         subsample=0.8,
