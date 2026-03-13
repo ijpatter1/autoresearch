@@ -9,7 +9,7 @@ import time
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
 
 from prepare import (
     FORWARD_HOURS,
@@ -136,15 +136,20 @@ _trained_model = None
 
 
 def count_model_params(model=None) -> int:
-    """Return approximate parameter count for the GBR model."""
+    """Return approximate parameter count for the ensemble model."""
     if model is None:
         model = _trained_model
     if model is None:
         return 0
+    gbr, rf = model
     n_params = 0
-    for estimators in model.estimators_:
+    # GBR tree nodes
+    for estimators in gbr.estimators_:
         for tree in estimators:
             n_params += tree.tree_.node_count
+    # RF tree nodes
+    for tree in rf.estimators_:
+        n_params += tree.tree_.node_count
     return n_params
 
 
@@ -202,7 +207,8 @@ def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     if model is None:
         raise RuntimeError("Model not trained. Run train.py first.")
 
-    preds = model.predict(features)
+    gbr, rf = model
+    preds = 0.5 * gbr.predict(features) + 0.5 * rf.predict(features)
     preds = _apply_regime_filter(preds, df)
     return preds, timestamps
 
@@ -241,12 +247,12 @@ def main():
 
     print(f"  Training samples: {len(features)}, Features: {features.shape[1]}")
 
-    # --- Train GBR with early stopping ---
-    print(f"Training GBR...")
+    # --- Train ensemble: GBR + RandomForest, average predictions ---
+    print(f"Training GBR + RandomForest ensemble...")
     train_start = time.time()
 
-    model = GradientBoostingRegressor(
-        n_estimators=500,
+    gbr = GradientBoostingRegressor(
+        n_estimators=300,
         max_depth=3,
         learning_rate=0.01,
         subsample=0.8,
@@ -254,10 +260,20 @@ def main():
         max_features=0.8,
         loss="huber",
         alpha=0.9,
-        n_iter_no_change=20,
-        validation_fraction=0.2,
     )
-    model.fit(features, targets)
+    gbr.fit(features, targets)
+
+    rf = RandomForestRegressor(
+        n_estimators=200,
+        max_depth=5,
+        min_samples_leaf=100,
+        max_features=0.7,
+        n_jobs=-1,
+    )
+    rf.fit(features, targets)
+
+    # Store both models
+    model = (gbr, rf)
 
     training_seconds = time.time() - train_start
     print(f"Training complete in {training_seconds:.1f}s")
@@ -268,7 +284,7 @@ def main():
 
     # --- Evaluate on train split ---
     print("Evaluating on training data...")
-    all_preds = model.predict(features)
+    all_preds = 0.5 * gbr.predict(features) + 0.5 * rf.predict(features)
     all_preds = _apply_regime_filter(all_preds, train_df)
 
     train_result = evaluate_model(all_preds, train_timestamps, n_params, split="train")
@@ -280,7 +296,7 @@ def main():
     val_features = _normalize(val_features, fit=False)
     val_features = np.nan_to_num(val_features, nan=0.0)
 
-    val_preds = model.predict(val_features)
+    val_preds = 0.5 * gbr.predict(val_features) + 0.5 * rf.predict(val_features)
     val_preds = _apply_regime_filter(val_preds, val_df)
 
     val_result = evaluate_model(val_preds, val_timestamps, n_params, split="val")
