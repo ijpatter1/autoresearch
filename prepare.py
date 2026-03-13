@@ -498,6 +498,11 @@ def _run_holdout_evaluation():
         print("ERROR: train.py must define predict_on_data(df) -> (predictions, timestamps)")
         sys.exit(1)
 
+    # Train the model first (predict_on_data requires a trained model)
+    print("Training model...")
+    train_module.main()
+    print()
+
     predictions, timestamps = train_module.predict_on_data(holdout_data)
     n_params = train_module.count_model_params()
 
