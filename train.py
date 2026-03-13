@@ -9,7 +9,7 @@ import time
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
+from sklearn.ensemble import GradientBoostingRegressor
 
 from prepare import (
     FORWARD_HOURS,
@@ -136,20 +136,15 @@ _trained_model = None
 
 
 def count_model_params(model=None) -> int:
-    """Return approximate parameter count for the ensemble model."""
+    """Return approximate parameter count for the GBR model."""
     if model is None:
         model = _trained_model
     if model is None:
         return 0
-    gbr, rf = model
     n_params = 0
-    # GBR tree nodes
-    for estimators in gbr.estimators_:
+    for estimators in model.estimators_:
         for tree in estimators:
             n_params += tree.tree_.node_count
-    # RF tree nodes
-    for tree in rf.estimators_:
-        n_params += tree.tree_.node_count
     return n_params
 
 
@@ -177,21 +172,18 @@ def _normalize(features: np.ndarray, fit: bool = False) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def _apply_regime_filter(preds: np.ndarray, df: pd.DataFrame) -> np.ndarray:
-    """Regime filter: no longs during crash, no shorts during strong uptrend."""
+    """Long-only filter with crash protection."""
     close = df["close"].values.astype(np.float64)
 
-    # Compute 168h returns for regime detection
+    # Long-only: never go short
+    preds = np.maximum(preds, 0.0)
+
+    # Crash filter: go flat during crashes (168h return < -15%)
     ret_168 = np.full(len(close), 0.0)
     ret_168[168:] = close[168:] / close[:-168] - 1.0
-    ret_168 = ret_168[MAX_LOOKBACK:][:len(preds)]  # align with predictions
-
-    # Crash filter: no longs when price dropped > 15% in a week
+    ret_168 = ret_168[MAX_LOOKBACK:][:len(preds)]
     crash_mask = ret_168 < -0.15
-    preds[crash_mask] = np.minimum(preds[crash_mask], 0.0)
-
-    # Bull filter: no shorts when price rose > 15% in a week
-    bull_mask = ret_168 > 0.15
-    preds[bull_mask] = np.maximum(preds[bull_mask], 0.0)
+    preds[crash_mask] = 0.0  # flat during crash
 
     return preds
 
@@ -207,8 +199,7 @@ def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     if model is None:
         raise RuntimeError("Model not trained. Run train.py first.")
 
-    gbr, rf = model
-    preds = 0.5 * gbr.predict(features) + 0.5 * rf.predict(features)
+    preds = model.predict(features)
     preds = _apply_regime_filter(preds, df)
     return preds, timestamps
 
@@ -247,11 +238,11 @@ def main():
 
     print(f"  Training samples: {len(features)}, Features: {features.shape[1]}")
 
-    # --- Train ensemble: GBR + RandomForest, average predictions ---
-    print(f"Training GBR + RandomForest ensemble...")
+    # --- Train GBR ---
+    print(f"Training GBR...")
     train_start = time.time()
 
-    gbr = GradientBoostingRegressor(
+    model = GradientBoostingRegressor(
         n_estimators=300,
         max_depth=3,
         learning_rate=0.01,
@@ -261,19 +252,7 @@ def main():
         loss="huber",
         alpha=0.9,
     )
-    gbr.fit(features, targets)
-
-    rf = RandomForestRegressor(
-        n_estimators=200,
-        max_depth=5,
-        min_samples_leaf=100,
-        max_features=0.7,
-        n_jobs=-1,
-    )
-    rf.fit(features, targets)
-
-    # Store both models
-    model = (gbr, rf)
+    model.fit(features, targets)
 
     training_seconds = time.time() - train_start
     print(f"Training complete in {training_seconds:.1f}s")
@@ -284,7 +263,7 @@ def main():
 
     # --- Evaluate on train split ---
     print("Evaluating on training data...")
-    all_preds = 0.5 * gbr.predict(features) + 0.5 * rf.predict(features)
+    all_preds = model.predict(features)
     all_preds = _apply_regime_filter(all_preds, train_df)
 
     train_result = evaluate_model(all_preds, train_timestamps, n_params, split="train")
@@ -296,7 +275,7 @@ def main():
     val_features = _normalize(val_features, fit=False)
     val_features = np.nan_to_num(val_features, nan=0.0)
 
-    val_preds = 0.5 * gbr.predict(val_features) + 0.5 * rf.predict(val_features)
+    val_preds = model.predict(val_features)
     val_preds = _apply_regime_filter(val_preds, val_df)
 
     val_result = evaluate_model(val_preds, val_timestamps, n_params, split="val")
