@@ -13,6 +13,7 @@ from sklearn.ensemble import GradientBoostingRegressor
 
 from prepare import (
     FORWARD_HOURS,
+    PRED_SCALE,
     TIME_BUDGET,
     evaluate_model,
     load_train_data,
@@ -28,16 +29,6 @@ VOLATILITY_WINDOWS = [24, 168]
 TREND_MA_WINDOWS = [24, 72, 168]
 ZSCORE_WINDOWS = [72, 168]
 MAX_LOOKBACK = 168  # maximum lookback window (1 week)
-PRED_SCALE = 0.8  # very selective — highest confidence trades only
-
-
-def compute_vol_168(df: pd.DataFrame) -> np.ndarray:
-    """Compute 168h rolling volatility (trimmed to valid start)."""
-    close = df["close"].values.astype(np.float64)
-    hourly_returns = np.zeros(len(close))
-    hourly_returns[1:] = close[1:] / close[:-1] - 1.0
-    vol = pd.Series(hourly_returns).rolling(168, min_periods=168).std().values
-    return vol[MAX_LOOKBACK:]
 
 
 def compute_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
@@ -169,7 +160,6 @@ def count_model_params(model=None) -> int:
 
 _feat_mean: np.ndarray | None = None
 _feat_std: np.ndarray | None = None
-_vol_median: float = 0.01  # median 168h volatility from training
 
 
 def _normalize(features: np.ndarray, fit: bool = False) -> np.ndarray:
@@ -186,27 +176,9 @@ def _normalize(features: np.ndarray, fit: bool = False) -> np.ndarray:
 # Prediction helper (used by prepare.py --evaluate-holdout)
 # ---------------------------------------------------------------------------
 
-def _apply_regime_filter(preds: np.ndarray, df: pd.DataFrame) -> np.ndarray:
-    """Long-only filter with crash protection and vol dampening."""
-    close = df["close"].values.astype(np.float64)
-
-    # Long-only: never go short
-    preds = np.maximum(preds, 0.0)
-
-    # Crash filter: go flat during crashes (168h return < -15%)
-    ret_168 = np.full(len(close), 0.0)
-    ret_168[168:] = close[168:] / close[:-168] - 1.0
-    ret_168 = ret_168[MAX_LOOKBACK:][:len(preds)]
-    crash_mask = ret_168 < -0.15
-    preds[crash_mask] = 0.0  # flat during crash
-
-    return preds
-
-
 def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     """Generate predictions on arbitrary OHLCV data."""
     features, timestamps = compute_features(df)
-    vol = compute_vol_168(df)
     features = np.nan_to_num(features, nan=0.0)
 
     model = _trained_model
@@ -214,7 +186,6 @@ def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         raise RuntimeError("Model not trained. Run train.py first.")
 
     preds = model.predict(features) * PRED_SCALE
-    preds = _apply_regime_filter(preds, df)
     return preds, timestamps
 
 
@@ -280,7 +251,6 @@ def main():
     # --- Evaluate on train split ---
     print("Evaluating on training data...")
     all_preds = model.predict(features) * PRED_SCALE
-    all_preds = _apply_regime_filter(all_preds, train_df)
 
     train_result = evaluate_model(all_preds, train_timestamps, n_params, split="train")
 
@@ -291,22 +261,6 @@ def main():
     val_features = np.nan_to_num(val_features, nan=0.0)
 
     val_preds = model.predict(val_features) * PRED_SCALE
-
-    # Debug: raw predictions before regime filter
-    print(f"  Val RAW preds: pos={np.sum(val_preds > 0)}, neg={np.sum(val_preds < 0)}")
-    print(f"  Val RAW range: [{val_preds.min():.6f}, {val_preds.max():.6f}]")
-    print(f"  Val RAW mean: {val_preds.mean():.6f}, std: {val_preds.std():.6f}")
-    print(f"  Val RAW >0.005: {np.sum(val_preds > 0.005)}, <-0.005: {np.sum(val_preds < -0.005)}")
-
-    val_preds = _apply_regime_filter(val_preds, val_df)
-
-    # Debug: print val prediction statistics after filter
-    above_thresh = np.sum(val_preds > 0.005)
-    below_thresh = np.sum(val_preds < -0.005)
-    flat = np.sum(np.abs(val_preds) <= 0.005)
-    print(f"  Val preds: long={above_thresh}, short={below_thresh}, flat={flat}")
-    print(f"  Val pred range: [{val_preds.min():.6f}, {val_preds.max():.6f}]")
-    print(f"  Val pred mean: {val_preds.mean():.6f}, std: {val_preds.std():.6f}")
 
     val_result = evaluate_model(val_preds, val_timestamps, n_params, split="val")
 
