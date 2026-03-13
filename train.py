@@ -26,6 +26,7 @@ from prepare import (
 RETURN_LOOKBACKS = [1, 4, 12, 24, 72, 168]
 VOLATILITY_WINDOWS = [24, 168]
 TREND_MA_WINDOWS = [24, 72, 168]
+ZSCORE_WINDOWS = [72, 168]
 MAX_LOOKBACK = 168  # maximum lookback window (1 week)
 
 
@@ -81,7 +82,14 @@ def compute_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
         price_rel_ma = np.where(ma > 0, close / ma - 1.0, 0.0)
         feature_cols.append(price_rel_ma)
 
-    # 5. Rolling max drawdown (crash detector) over 168h
+    # 5. Rolling z-scores (mean-reversion signals)
+    for w in ZSCORE_WINDOWS:
+        rolling_mean = close_series.rolling(w, min_periods=w).mean().values
+        rolling_std = close_series.rolling(w, min_periods=w).std().values
+        zscore = np.where(rolling_std > 0, (close - rolling_mean) / rolling_std, 0.0)
+        feature_cols.append(zscore)
+
+    # 6. Rolling max drawdown (crash detector) over 168h
     rolling_max = close_series.rolling(168, min_periods=168).max().values
     rolling_dd = np.where(rolling_max > 0, close / rolling_max - 1.0, 0.0)
     feature_cols.append(rolling_dd)
@@ -165,16 +173,21 @@ def _normalize(features: np.ndarray, fit: bool = False) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def _apply_regime_filter(preds: np.ndarray, df: pd.DataFrame) -> np.ndarray:
-    """During crash regime (168h return < -15%): clamp predictions to non-positive."""
+    """Regime filter: no longs during crash, no shorts during strong uptrend."""
     close = df["close"].values.astype(np.float64)
 
-    # Crash regime filter: if 168h return is very negative, prevent longs
+    # Compute 168h returns for regime detection
     ret_168 = np.full(len(close), 0.0)
     ret_168[168:] = close[168:] / close[:-168] - 1.0
     ret_168 = ret_168[MAX_LOOKBACK:][:len(preds)]  # align with predictions
 
-    crash_mask = ret_168 < -0.15  # 15% drop over a week = crash
-    preds[crash_mask] = np.minimum(preds[crash_mask], 0.0)  # no longs during crash
+    # Crash filter: no longs when price dropped > 15% in a week
+    crash_mask = ret_168 < -0.15
+    preds[crash_mask] = np.minimum(preds[crash_mask], 0.0)
+
+    # Bull filter: no shorts when price rose > 15% in a week
+    bull_mask = ret_168 > 0.15
+    preds[bull_mask] = np.maximum(preds[bull_mask], 0.0)
 
     return preds
 
@@ -204,12 +217,10 @@ def main():
 
     total_start = time.time()
 
-    # --- Load data (use only recent 2 years to reduce distribution shift) ---
+    # --- Load data ---
     print("Loading training data...")
     train_df = load_train_data()
-    # Use only 2021-2022 for training (closer to validation period 2023-2024)
-    train_df = train_df[train_df["timestamp"] >= pd.Timestamp("2021-01-01")].reset_index(drop=True)
-    print(f"  {len(train_df)} rows (filtered to 2021+)")
+    print(f"  {len(train_df)} rows")
 
     # --- Compute features and targets ---
     features, timestamps = compute_features(train_df)
