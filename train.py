@@ -28,7 +28,7 @@ VOLATILITY_WINDOWS = [24, 168]
 TREND_MA_WINDOWS = [24, 72, 168]
 ZSCORE_WINDOWS = [72, 168]
 MAX_LOOKBACK = 168  # maximum lookback window (1 week)
-PRED_SCALE = 0.8  # very selective — highest confidence trades only
+PRED_SCALE = 0.7  # ultra selective
 
 
 def compute_vol_168(df: pd.DataFrame) -> np.ndarray:
