@@ -186,15 +186,8 @@ def _apply_regime_filter(preds: np.ndarray, df: pd.DataFrame) -> np.ndarray:
     crash_mask = ret_168 < -0.15
     preds[crash_mask] = 0.0  # flat during crash
 
-    # Volatility dampening: reduce position size in high-vol regimes
-    hourly_returns = np.zeros(len(close))
-    hourly_returns[1:] = close[1:] / close[:-1] - 1.0
-    vol_168 = pd.Series(hourly_returns).rolling(168, min_periods=168).std().values
-    vol_168 = vol_168[MAX_LOOKBACK:][:len(preds)]
-    vol_median = np.nanmedian(vol_168)
-    if vol_median > 0:
-        dampen = np.where(vol_168 > vol_median, vol_median / vol_168, 1.0)
-        preds = preds * dampen
+    # Cap predictions to limit max position size
+    preds = np.minimum(preds, 0.01)
 
     return preds
 
