@@ -216,6 +216,9 @@ def main():
     targets = targets[valid]
     train_timestamps = timestamps[valid]
 
+    # Winsorize targets at ±5% to reduce influence of extreme returns
+    targets = np.clip(targets, -0.05, 0.05)
+
     # GBR is invariant to feature scaling — skip normalization to avoid
     # distribution mismatch between train/val periods.
     features = np.nan_to_num(features, nan=0.0)
