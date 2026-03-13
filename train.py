@@ -9,7 +9,7 @@ import time
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.linear_model import Ridge
 
 from prepare import (
     FORWARD_HOURS,
@@ -131,30 +131,16 @@ def compute_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     return features, timestamps
 
 
-def compute_targets(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """Compute vol-adjusted 24-hour forward returns.
+def compute_targets(df: pd.DataFrame) -> np.ndarray:
+    """Compute 24-hour forward returns: close[t+24]/close[t] - 1.
 
-    Returns:
-        targets: vol-adjusted forward returns (same length as df, NaN-padded)
-        vol_168: rolling 168h volatility for rescaling predictions
+    Returns array of same length as df. Last FORWARD_HOURS entries are NaN.
     """
     close = df["close"].values.astype(np.float64)
     n = len(close)
-    raw_returns = np.full(n, np.nan)
-    raw_returns[:n - FORWARD_HOURS] = close[FORWARD_HOURS:] / close[:n - FORWARD_HOURS] - 1.0
-
-    # Compute rolling volatility for normalization
-    hourly_returns = np.zeros(n)
-    hourly_returns[1:] = close[1:] / close[:-1] - 1.0
-    vol = pd.Series(hourly_returns).rolling(168, min_periods=168).std().values
-    vol = np.where(vol > 1e-8, vol, 1e-8)
-
-    # Vol-adjusted targets: raw_return / (vol * sqrt(24))
-    # sqrt(24) scales hourly vol to ~24h vol
-    vol_24 = vol * np.sqrt(24)
-    targets = raw_returns / vol_24
-
-    return targets, vol
+    targets = np.full(n, np.nan)
+    targets[:n - FORWARD_HOURS] = close[FORWARD_HOURS:] / close[:n - FORWARD_HOURS] - 1.0
+    return targets
 
 
 # ---------------------------------------------------------------------------
@@ -165,16 +151,14 @@ _trained_model = None
 
 
 def count_model_params(model=None) -> int:
-    """Return approximate parameter count for the GBR model."""
+    """Return parameter count for the model."""
     if model is None:
         model = _trained_model
     if model is None:
         return 0
-    n_params = 0
-    for estimators in model.estimators_:
-        for tree in estimators:
-            n_params += tree.tree_.node_count
-    return n_params
+    if hasattr(model, 'coef_'):
+        return len(model.coef_) + 1  # weights + bias
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -220,15 +204,14 @@ def _apply_regime_filter(preds: np.ndarray, df: pd.DataFrame) -> np.ndarray:
 def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     """Generate predictions on arbitrary OHLCV data."""
     features, timestamps = compute_features(df)
-    vol = compute_vol_168(df)
     features = np.nan_to_num(features, nan=0.0)
+    features = _normalize(features, fit=False)
 
     model = _trained_model
     if model is None:
         raise RuntimeError("Model not trained. Run train.py first.")
 
-    vol_24 = vol * np.sqrt(24)
-    preds = model.predict(features) * vol_24 * PRED_SCALE
+    preds = model.predict(features) * PRED_SCALE
     preds = _apply_regime_filter(preds, df)
     return preds, timestamps
 
@@ -249,42 +232,30 @@ def main():
 
     # --- Compute features and targets ---
     features, timestamps = compute_features(train_df)
-    targets, train_vol = compute_targets(train_df)
+    targets = compute_targets(train_df)
 
-    # Align: targets and vol need same trimming as features (MAX_LOOKBACK from start)
+    # Align: targets need same trimming as features (MAX_LOOKBACK from start)
     targets = targets[MAX_LOOKBACK:]
-    train_vol = train_vol[MAX_LOOKBACK:]
 
     # Drop rows where targets are NaN (last FORWARD_HOURS rows)
     valid = ~np.isnan(targets)
     features = features[valid]
     targets = targets[valid]
-    train_vol = train_vol[valid]
     train_timestamps = timestamps[valid]
 
-    # Winsorize vol-adjusted targets at ±3 (3 sigma)
-    targets = np.clip(targets, -3.0, 3.0)
+    # Winsorize targets at ±5% to reduce influence of extreme returns
+    targets = np.clip(targets, -0.05, 0.05)
 
-    # GBR is invariant to feature scaling — skip normalization to avoid
-    # distribution mismatch between train/val periods.
     features = np.nan_to_num(features, nan=0.0)
+    features = _normalize(features, fit=True)
 
     print(f"  Training samples: {len(features)}, Features: {features.shape[1]}")
 
-    # --- Train GBR ---
-    print(f"Training GBR...")
+    # --- Train Ridge ---
+    print(f"Training Ridge...")
     train_start = time.time()
 
-    model = GradientBoostingRegressor(
-        n_estimators=300,
-        max_depth=3,
-        learning_rate=0.01,
-        subsample=0.8,
-        min_samples_leaf=100,
-        max_features=0.8,
-        loss="squared_error",
-        random_state=42,
-    )
+    model = Ridge(alpha=100.0)
     model.fit(features, targets)
 
     training_seconds = time.time() - train_start
@@ -296,9 +267,7 @@ def main():
 
     # --- Evaluate on train split ---
     print("Evaluating on training data...")
-    # Model predicts vol-adjusted returns, scale back to raw returns
-    vol_24_train = train_vol * np.sqrt(24)
-    all_preds = model.predict(features) * vol_24_train * PRED_SCALE
+    all_preds = model.predict(features) * PRED_SCALE
     all_preds = _apply_regime_filter(all_preds, train_df)
 
     train_result = evaluate_model(all_preds, train_timestamps, n_params, split="train")
@@ -308,12 +277,25 @@ def main():
     val_df = load_val_data()
     val_features, val_timestamps = compute_features(val_df)
     val_features = np.nan_to_num(val_features, nan=0.0)
-    val_vol = compute_vol_168(val_df)
+    val_features = _normalize(val_features, fit=False)
 
-    vol_24_val = val_vol * np.sqrt(24)
-    val_preds = model.predict(val_features) * vol_24_val * PRED_SCALE
+    val_preds = model.predict(val_features) * PRED_SCALE
+
+    # Debug: raw predictions before regime filter
+    print(f"  Val RAW preds: pos={np.sum(val_preds > 0)}, neg={np.sum(val_preds < 0)}")
+    print(f"  Val RAW range: [{val_preds.min():.6f}, {val_preds.max():.6f}]")
+    print(f"  Val RAW mean: {val_preds.mean():.6f}, std: {val_preds.std():.6f}")
+    print(f"  Val RAW >0.005: {np.sum(val_preds > 0.005)}, <-0.005: {np.sum(val_preds < -0.005)}")
 
     val_preds = _apply_regime_filter(val_preds, val_df)
+
+    # Debug: print val prediction statistics after filter
+    above_thresh = np.sum(val_preds > 0.005)
+    below_thresh = np.sum(val_preds < -0.005)
+    flat = np.sum(np.abs(val_preds) <= 0.005)
+    print(f"  Val preds: long={above_thresh}, short={below_thresh}, flat={flat}")
+    print(f"  Val pred range: [{val_preds.min():.6f}, {val_preds.max():.6f}]")
+    print(f"  Val pred mean: {val_preds.mean():.6f}, std: {val_preds.std():.6f}")
 
     val_result = evaluate_model(val_preds, val_timestamps, n_params, split="val")
 
