@@ -14,6 +14,7 @@ Public API for train.py:
   load_train_data() -> pd.DataFrame
   load_val_data()   -> pd.DataFrame
   evaluate_model(predictions, timestamps, n_params, split) -> dict
+  PRED_SCALE        -> float (fixed prediction multiplier)
   TIME_BUDGET       -> int (seconds)
 """
 
@@ -43,6 +44,7 @@ FORWARD_HOURS = 24      # predict 24-hour forward returns
 THRESHOLD = 0.005       # 0.5% threshold for long/short signals
 FEE_RATE = 0.001        # 0.1% per trade (one side)
 SLIPPAGE_RATE = 0.0005  # 0.05% per trade (one side)
+PRED_SCALE = 1.0        # fixed; do not redefine in train.py
 
 # Temporal split boundaries (inclusive)
 TRAIN_START = pd.Timestamp("2018-01-01")

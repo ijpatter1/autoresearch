@@ -49,6 +49,10 @@ These approaches are explicitly prohibited. If you find yourself doing any of th
 
 4. **No signal function factories.** Do not write functions like `make_momentum_fn(scale)` or `make_mean_reversion_fn(lookback, threshold)` and loop over thousands of parameter combinations. The experiment loop across git commits is what provides exploration — not a search loop within a single run.
 
+5. **No post-hoc prediction scaling.** Do not multiply predictions by constants (e.g. `preds *= 0.8`) to change how many trades trigger. `PRED_SCALE` is a fixed constant in `prepare.py` — do not redefine it in `train.py`. If predictions are systematically too large or too small, fix the model (target normalization, loss function, architecture), not the output.
+
+6. **No hardcoded regime filters.** Do not apply if/else logic to predictions after the model produces them (e.g. zeroing out shorts, flattening during drawdowns, scaling by volatility). The model already has features that encode this information — rolling drawdown, volatility, returns at various lookbacks. Let it learn when to go flat. A post-processing function that overrides model output with hand-coded rules is domain-knowledge injection, not learning.
+
 The spirit of these rules: the 2-minute training budget should be spent **training a model** (fitting weights to data), not evaluating thousands of pre-built strategies.
 
 ## The goal
