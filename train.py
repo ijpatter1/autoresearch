@@ -1,5 +1,5 @@
 """
-Autotrader baseline model. Predicts BTC/USD 24-hour forward returns.
+Autotrader model. Predicts BTC/USD 24-hour forward returns.
 
 This file is the ONLY file the autonomous agent modifies.
 Usage: uv run train.py
@@ -9,9 +9,7 @@ import time
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from sklearn.ensemble import GradientBoostingRegressor
 
 from prepare import (
     FORWARD_HOURS,
@@ -27,7 +25,19 @@ from prepare import (
 
 RETURN_LOOKBACKS = [1, 4, 12, 24, 72, 168]
 VOLATILITY_WINDOWS = [24, 168]
+TREND_MA_WINDOWS = [24, 72, 168]
+ZSCORE_WINDOWS = [72, 168]
 MAX_LOOKBACK = 168  # maximum lookback window (1 week)
+PRED_SCALE = 1.2  # scale up conservative GBR predictions
+
+
+def compute_vol_168(df: pd.DataFrame) -> np.ndarray:
+    """Compute 168h rolling volatility (trimmed to valid start)."""
+    close = df["close"].values.astype(np.float64)
+    hourly_returns = np.zeros(len(close))
+    hourly_returns[1:] = close[1:] / close[:-1] - 1.0
+    vol = pd.Series(hourly_returns).rolling(168, min_periods=168).std().values
+    return vol[MAX_LOOKBACK:]
 
 
 def compute_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
@@ -63,14 +73,53 @@ def compute_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     vol_series = pd.Series(volume)
     vol_24 = vol_series.rolling(24, min_periods=24).mean().values
     vol_168 = vol_series.rolling(168, min_periods=168).mean().values
-    # Avoid division by zero
     vol_ratio = np.where(vol_168 > 0, vol_24 / vol_168, 1.0)
     feature_cols.append(vol_ratio)
 
-    # 4. Hour of day (cyclical)
-    hours = pd.to_datetime(ts).hour
+    # 4. Price relative to moving averages (trend signals)
+    close_series = pd.Series(close)
+    for w in TREND_MA_WINDOWS:
+        ma = close_series.rolling(w, min_periods=w).mean().values
+        price_rel_ma = np.where(ma > 0, close / ma - 1.0, 0.0)
+        feature_cols.append(price_rel_ma)
+
+    # 5. Rolling z-scores (mean-reversion signals)
+    for w in ZSCORE_WINDOWS:
+        rolling_mean = close_series.rolling(w, min_periods=w).mean().values
+        rolling_std = close_series.rolling(w, min_periods=w).std().values
+        zscore = np.where(rolling_std > 0, (close - rolling_mean) / rolling_std, 0.0)
+        feature_cols.append(zscore)
+
+    # 6. Rolling max drawdown (crash detector) over 168h
+    rolling_max = close_series.rolling(168, min_periods=168).max().values
+    rolling_dd = np.where(rolling_max > 0, close / rolling_max - 1.0, 0.0)
+    feature_cols.append(rolling_dd)
+
+    # 6. High-low range volatility (24h average)
+    high = df["high"].values.astype(np.float64)
+    low = df["low"].values.astype(np.float64)
+    hl_range = np.where(close > 0, (high - low) / close, 0.0)
+    hl_range_24 = pd.Series(hl_range).rolling(24, min_periods=24).mean().values
+    feature_cols.append(hl_range_24)
+
+    # 7. Hour of day (cyclical)
+    dt = pd.to_datetime(ts)
+    hours = dt.hour
     feature_cols.append(np.sin(2 * np.pi * hours / 24))
     feature_cols.append(np.cos(2 * np.pi * hours / 24))
+
+    # 8. Day of week (cyclical) — crypto has weekly patterns
+    dow = dt.dayofweek
+    feature_cols.append(np.sin(2 * np.pi * dow / 7))
+    feature_cols.append(np.cos(2 * np.pi * dow / 7))
+
+    # 9. Momentum acceleration: 24h return - 72h return (trend strengthening?)
+    ret_24 = np.full(len(close), np.nan)
+    ret_24[24:] = close[24:] / close[:-24] - 1.0
+    ret_72 = np.full(len(close), np.nan)
+    ret_72[72:] = close[72:] / close[:-72] - 1.0
+    accel = ret_24 - ret_72 / 3  # normalize 72h to per-24h scale
+    feature_cols.append(accel)
 
     features = np.column_stack(feature_cols)
 
@@ -98,31 +147,20 @@ def compute_targets(df: pd.DataFrame) -> np.ndarray:
 # Model
 # ---------------------------------------------------------------------------
 
-N_FEATURES = len(RETURN_LOOKBACKS) + len(VOLATILITY_WINDOWS) + 1 + 2  # 11 features
+_trained_model = None
 
 
-class ForwardReturnModel(nn.Module):
-    """Simple feedforward network: n_features -> 32 -> 16 -> 1"""
-
-    def __init__(self, n_features: int = N_FEATURES):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_features, 32),
-            nn.ReLU(),
-            nn.Linear(32, 16),
-            nn.ReLU(),
-            nn.Linear(16, 1),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)
-
-
-def count_model_params(model: nn.Module | None = None) -> int:
-    """Return total trainable parameter count."""
+def count_model_params(model=None) -> int:
+    """Return approximate parameter count for the GBR model."""
     if model is None:
-        model = ForwardReturnModel()
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+        model = _trained_model
+    if model is None:
+        return 0
+    n_params = 0
+    for estimators in model.estimators_:
+        for tree in estimators:
+            n_params += tree.tree_.node_count
+    return n_params
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +169,7 @@ def count_model_params(model: nn.Module | None = None) -> int:
 
 _feat_mean: np.ndarray | None = None
 _feat_std: np.ndarray | None = None
+_vol_median: float = 0.01  # median 168h volatility from training
 
 
 def _normalize(features: np.ndarray, fit: bool = False) -> np.ndarray:
@@ -139,7 +178,7 @@ def _normalize(features: np.ndarray, fit: bool = False) -> np.ndarray:
     if fit:
         _feat_mean = np.nanmean(features, axis=0)
         _feat_std = np.nanstd(features, axis=0)
-        _feat_std[_feat_std < 1e-8] = 1.0  # avoid division by zero
+        _feat_std[_feat_std < 1e-8] = 1.0
     return (features - _feat_mean) / _feat_std
 
 
@@ -147,31 +186,35 @@ def _normalize(features: np.ndarray, fit: bool = False) -> np.ndarray:
 # Prediction helper (used by prepare.py --evaluate-holdout)
 # ---------------------------------------------------------------------------
 
-_trained_model: nn.Module | None = None
+def _apply_regime_filter(preds: np.ndarray, df: pd.DataFrame) -> np.ndarray:
+    """Long-only filter with crash protection and vol dampening."""
+    close = df["close"].values.astype(np.float64)
+
+    # Long-only: never go short
+    preds = np.maximum(preds, 0.0)
+
+    # Crash filter: go flat during crashes (168h return < -15%)
+    ret_168 = np.full(len(close), 0.0)
+    ret_168[168:] = close[168:] / close[:-168] - 1.0
+    ret_168 = ret_168[MAX_LOOKBACK:][:len(preds)]
+    crash_mask = ret_168 < -0.15
+    preds[crash_mask] = 0.0  # flat during crash
+
+    return preds
 
 
 def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
-    """Generate predictions on arbitrary OHLCV data.
-
-    Used by prepare.py for holdout evaluation. Requires that the model
-    has already been trained (i.e., train.py has been run).
-    """
+    """Generate predictions on arbitrary OHLCV data."""
     features, timestamps = compute_features(df)
-    features = _normalize(features, fit=False)
-
-    # Replace any remaining NaN with 0
+    vol = compute_vol_168(df)
     features = np.nan_to_num(features, nan=0.0)
 
     model = _trained_model
     if model is None:
         raise RuntimeError("Model not trained. Run train.py first.")
 
-    device = next(model.parameters()).device
-    model.eval()
-    with torch.no_grad():
-        X = torch.tensor(features, dtype=torch.float32, device=device)
-        preds = model(X).cpu().numpy()
-
+    preds = model.predict(features) * PRED_SCALE
+    preds = _apply_regime_filter(preds, df)
     return preds, timestamps
 
 
@@ -183,15 +226,6 @@ def main():
     global _trained_model
 
     total_start = time.time()
-
-    # Device selection: MPS (Apple Silicon) > CUDA > CPU
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    print(f"Device: {device}")
 
     # --- Load data ---
     print("Loading training data...")
@@ -211,71 +245,39 @@ def main():
     targets = targets[valid]
     train_timestamps = timestamps[valid]
 
-    # Normalize features (fit on training data)
-    features = _normalize(features, fit=True)
-
-    # Replace any remaining NaN with 0
+    # GBR is invariant to feature scaling — skip normalization to avoid
+    # distribution mismatch between train/val periods.
     features = np.nan_to_num(features, nan=0.0)
 
     print(f"  Training samples: {len(features)}, Features: {features.shape[1]}")
 
-    # --- Setup model ---
-    model = ForwardReturnModel(n_features=features.shape[1]).to(device)
-    n_params = count_model_params(model)
-    print(f"  Model parameters: {n_params}")
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    loss_fn = nn.MSELoss()
-
-    # --- Create DataLoader ---
-    X_tensor = torch.tensor(features, dtype=torch.float32)
-    y_tensor = torch.tensor(targets, dtype=torch.float32)
-    dataset = TensorDataset(X_tensor, y_tensor)
-    loader = DataLoader(dataset, batch_size=512, shuffle=True, drop_last=False)
-
-    # --- Train ---
-    print(f"Training for up to {TIME_BUDGET}s...")
+    # --- Train GBR ---
+    print(f"Training GBR...")
     train_start = time.time()
-    epoch = 0
 
-    while time.time() - train_start < TIME_BUDGET:
-        epoch += 1
-        epoch_loss = 0.0
-        n_batches = 0
-        model.train()
-
-        for X_batch, y_batch in loader:
-            X_batch = X_batch.to(device)
-            y_batch = y_batch.to(device)
-
-            pred = model(X_batch)
-            loss = loss_fn(pred, y_batch)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            epoch_loss += loss.item()
-            n_batches += 1
-
-            if time.time() - train_start >= TIME_BUDGET:
-                break
-
-        if epoch % 10 == 0 or epoch == 1:
-            avg_loss = epoch_loss / max(n_batches, 1)
-            elapsed = time.time() - train_start
-            print(f"  Epoch {epoch:4d} | loss={avg_loss:.6f} | {elapsed:.1f}s")
+    model = GradientBoostingRegressor(
+        n_estimators=300,
+        max_depth=3,
+        learning_rate=0.01,
+        subsample=0.8,
+        min_samples_leaf=100,
+        max_features=0.8,
+        loss="squared_error",
+        random_state=42,
+    )
+    model.fit(features, targets)
 
     training_seconds = time.time() - train_start
-    print(f"Training complete: {epoch} epochs in {training_seconds:.1f}s")
+    print(f"Training complete in {training_seconds:.1f}s")
 
     _trained_model = model
+    n_params = count_model_params(model)
+    print(f"  Model parameters (node count): {n_params}")
 
     # --- Evaluate on train split ---
     print("Evaluating on training data...")
-    model.eval()
-    with torch.no_grad():
-        all_preds = model(X_tensor.to(device)).cpu().numpy()
+    all_preds = model.predict(features) * PRED_SCALE
+    all_preds = _apply_regime_filter(all_preds, train_df)
 
     train_result = evaluate_model(all_preds, train_timestamps, n_params, split="train")
 
@@ -283,12 +285,25 @@ def main():
     print("Evaluating on validation data...")
     val_df = load_val_data()
     val_features, val_timestamps = compute_features(val_df)
-    val_features = _normalize(val_features, fit=False)
     val_features = np.nan_to_num(val_features, nan=0.0)
 
-    with torch.no_grad():
-        X_val = torch.tensor(val_features, dtype=torch.float32, device=device)
-        val_preds = model(X_val).cpu().numpy()
+    val_preds = model.predict(val_features) * PRED_SCALE
+
+    # Debug: raw predictions before regime filter
+    print(f"  Val RAW preds: pos={np.sum(val_preds > 0)}, neg={np.sum(val_preds < 0)}")
+    print(f"  Val RAW range: [{val_preds.min():.6f}, {val_preds.max():.6f}]")
+    print(f"  Val RAW mean: {val_preds.mean():.6f}, std: {val_preds.std():.6f}")
+    print(f"  Val RAW >0.005: {np.sum(val_preds > 0.005)}, <-0.005: {np.sum(val_preds < -0.005)}")
+
+    val_preds = _apply_regime_filter(val_preds, val_df)
+
+    # Debug: print val prediction statistics after filter
+    above_thresh = np.sum(val_preds > 0.005)
+    below_thresh = np.sum(val_preds < -0.005)
+    flat = np.sum(np.abs(val_preds) <= 0.005)
+    print(f"  Val preds: long={above_thresh}, short={below_thresh}, flat={flat}")
+    print(f"  Val pred range: [{val_preds.min():.6f}, {val_preds.max():.6f}]")
+    print(f"  Val pred mean: {val_preds.mean():.6f}, std: {val_preds.std():.6f}")
 
     val_result = evaluate_model(val_preds, val_timestamps, n_params, split="val")
 
