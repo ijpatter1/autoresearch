@@ -27,6 +27,7 @@ from prepare import (
 
 RETURN_LOOKBACKS = [1, 4, 12, 24, 72, 168]
 VOLATILITY_WINDOWS = [24, 168]
+ZSCORE_WINDOWS = [24, 72, 168]
 MAX_LOOKBACK = 168  # maximum lookback window (1 week)
 
 
@@ -67,7 +68,15 @@ def compute_features(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     vol_ratio = np.where(vol_168 > 0, vol_24 / vol_168, 1.0)
     feature_cols.append(vol_ratio)
 
-    # 4. Hour of day (cyclical)
+    # 4. Rolling z-scores of returns (mean-reversion signals)
+    close_series = pd.Series(close)
+    for w in ZSCORE_WINDOWS:
+        rolling_mean = close_series.rolling(w, min_periods=w).mean().values
+        rolling_std = close_series.rolling(w, min_periods=w).std().values
+        zscore = np.where(rolling_std > 0, (close - rolling_mean) / rolling_std, 0.0)
+        feature_cols.append(zscore)
+
+    # 5. Hour of day (cyclical)
     hours = pd.to_datetime(ts).hour
     feature_cols.append(np.sin(2 * np.pi * hours / 24))
     feature_cols.append(np.cos(2 * np.pi * hours / 24))
@@ -98,11 +107,11 @@ def compute_targets(df: pd.DataFrame) -> np.ndarray:
 # Model
 # ---------------------------------------------------------------------------
 
-N_FEATURES = len(RETURN_LOOKBACKS) + len(VOLATILITY_WINDOWS) + 1 + 2  # 11 features
+N_FEATURES = len(RETURN_LOOKBACKS) + len(VOLATILITY_WINDOWS) + 1 + len(ZSCORE_WINDOWS) + 2  # 14 features
 
 
 class ForwardReturnModel(nn.Module):
-    """Simple feedforward network: n_features -> 32 -> 16 -> 1"""
+    """Simple feedforward network: n_features -> 32 -> 16 -> 1, tanh-scaled output"""
 
     def __init__(self, n_features: int = N_FEATURES):
         super().__init__()
@@ -113,9 +122,11 @@ class ForwardReturnModel(nn.Module):
             nn.ReLU(),
             nn.Linear(16, 1),
         )
+        self.output_scale = 0.05  # bound predictions to ±5%
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x).squeeze(-1)
+        raw = self.net(x).squeeze(-1)
+        return torch.tanh(raw) * self.output_scale
 
 
 def count_model_params(model: nn.Module | None = None) -> int:
@@ -224,8 +235,8 @@ def main():
     n_params = count_model_params(model)
     print(f"  Model parameters: {n_params}")
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    loss_fn = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-4)
+    loss_fn = nn.HuberLoss(delta=0.02)
 
     # --- Create DataLoader ---
     X_tensor = torch.tensor(features, dtype=torch.float32)
