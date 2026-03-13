@@ -28,7 +28,7 @@ VOLATILITY_WINDOWS = [24, 168]
 TREND_MA_WINDOWS = [24, 72, 168]
 ZSCORE_WINDOWS = [72, 168]
 MAX_LOOKBACK = 168  # maximum lookback window (1 week)
-PRED_SCALE = 1.1  # scale up conservative GBR predictions
+PRED_SCALE = 1.5  # scale up conservative GBR predictions
 
 
 def compute_vol_168(df: pd.DataFrame) -> np.ndarray:
@@ -173,7 +173,7 @@ def _normalize(features: np.ndarray, fit: bool = False) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def _apply_regime_filter(preds: np.ndarray, df: pd.DataFrame) -> np.ndarray:
-    """Long-only filter with crash protection."""
+    """Long-only filter with crash protection and vol dampening."""
     close = df["close"].values.astype(np.float64)
 
     # Long-only: never go short
@@ -185,6 +185,16 @@ def _apply_regime_filter(preds: np.ndarray, df: pd.DataFrame) -> np.ndarray:
     ret_168 = ret_168[MAX_LOOKBACK:][:len(preds)]
     crash_mask = ret_168 < -0.15
     preds[crash_mask] = 0.0  # flat during crash
+
+    # Volatility dampening: reduce position size in high-vol regimes
+    hourly_returns = np.zeros(len(close))
+    hourly_returns[1:] = close[1:] / close[:-1] - 1.0
+    vol_168 = pd.Series(hourly_returns).rolling(168, min_periods=168).std().values
+    vol_168 = vol_168[MAX_LOOKBACK:][:len(preds)]
+    vol_median = np.nanmedian(vol_168)
+    if vol_median > 0:
+        dampen = np.where(vol_168 > vol_median, vol_median / vol_168, 1.0)
+        preds = preds * dampen
 
     return preds
 
