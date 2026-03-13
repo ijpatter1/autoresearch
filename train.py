@@ -204,10 +204,12 @@ def main():
 
     total_start = time.time()
 
-    # --- Load data ---
+    # --- Load data (use only recent 2 years to reduce distribution shift) ---
     print("Loading training data...")
     train_df = load_train_data()
-    print(f"  {len(train_df)} rows")
+    # Use only 2021-2022 for training (closer to validation period 2023-2024)
+    train_df = train_df[train_df["timestamp"] >= pd.Timestamp("2021-01-01")].reset_index(drop=True)
+    print(f"  {len(train_df)} rows (filtered to 2021+)")
 
     # --- Compute features and targets ---
     features, timestamps = compute_features(train_df)
