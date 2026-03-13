@@ -184,7 +184,7 @@ def _apply_regime_filter(preds: np.ndarray, df: pd.DataFrame) -> np.ndarray:
     ret_168[168:] = close[168:] / close[:-168] - 1.0
     ret_168 = ret_168[MAX_LOOKBACK:][:len(preds)]  # align with predictions
 
-    crash_mask = ret_168 < -0.15  # 15% drop over a week = crash
+    crash_mask = ret_168 < -0.20  # 20% drop over a week = crash
     preds[crash_mask] = np.minimum(preds[crash_mask], 0.0)  # no longs during crash
 
     return preds
