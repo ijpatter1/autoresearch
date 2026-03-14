@@ -9,8 +9,7 @@ import time
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn as nn
+from sklearn.linear_model import Ridge
 
 from prepare import (
     FORWARD_HOURS,
@@ -116,35 +115,18 @@ def compute_targets(df: pd.DataFrame) -> np.ndarray:
 # Model
 # ---------------------------------------------------------------------------
 
-class ReturnPredictor(nn.Module):
-    """Small feedforward network for return prediction."""
-
-    def __init__(self, n_features: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_features, 16),
-            nn.BatchNorm1d(16),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(16, 1),
-        )
-
-    def forward(self, x):
-        return self.net(x).squeeze(-1)
-
-
 _trained_model = None
 _feat_mean: np.ndarray | None = None
 _feat_std: np.ndarray | None = None
 
 
 def count_model_params(model=None) -> int:
-    """Return number of trainable parameters."""
+    """Return number of parameters (coefficients + intercept)."""
     if model is None:
         model = _trained_model
     if model is None:
         return 0
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return model.coef_.size + 1
 
 
 def _normalize(features: np.ndarray, fit: bool = False) -> np.ndarray:
@@ -171,11 +153,7 @@ def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     if model is None:
         raise RuntimeError("Model not trained. Run train.py first.")
 
-    model.eval()
-    with torch.no_grad():
-        X = torch.tensor(features, dtype=torch.float32)
-        preds = model(X).numpy() * PRED_SCALE
-
+    preds = model.predict(features) * PRED_SCALE
     return preds, timestamps
 
 
@@ -212,50 +190,14 @@ def main():
     # Z-score normalize features
     features = _normalize(features, fit=True)
 
-    n_features = features.shape[1]
-    print(f"  Training samples: {len(features)}, Features: {n_features}")
+    print(f"  Training samples: {len(features)}, Features: {features.shape[1]}")
 
-    # --- Train neural network ---
-    print("Training NN...")
+    # --- Train Ridge ---
+    print("Training Ridge regression...")
     train_start = time.time()
 
-    model = ReturnPredictor(n_features)
-    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-3)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
-    loss_fn = nn.MSELoss()
-
-    X_train = torch.tensor(features, dtype=torch.float32)
-    y_train = torch.tensor(targets, dtype=torch.float32)
-
-    # Mini-batch training
-    batch_size = 2048
-    n_samples = len(X_train)
-    model.train()
-
-    for epoch in range(100):
-        perm = torch.randperm(n_samples)
-        epoch_loss = 0.0
-        n_batches = 0
-
-        for i in range(0, n_samples, batch_size):
-            idx = perm[i:i + batch_size]
-            X_batch = X_train[idx]
-            y_batch = y_train[idx]
-
-            optimizer.zero_grad()
-            pred = model(X_batch)
-            loss = loss_fn(pred, y_batch)
-            loss.backward()
-            optimizer.step()
-
-            epoch_loss += loss.item()
-            n_batches += 1
-
-        scheduler.step()
-
-        if (epoch + 1) % 10 == 0:
-            avg_loss = epoch_loss / n_batches
-            print(f"  Epoch {epoch + 1}: loss={avg_loss:.6f}")
+    model = Ridge(alpha=1.0)
+    model.fit(features, targets)
 
     training_seconds = time.time() - train_start
     print(f"Training complete in {training_seconds:.1f}s")
@@ -266,9 +208,7 @@ def main():
 
     # --- Evaluate on train split ---
     print("Evaluating on training data...")
-    model.eval()
-    with torch.no_grad():
-        all_preds = model(X_train).numpy() * PRED_SCALE
+    all_preds = model.predict(features) * PRED_SCALE
 
     train_result = evaluate_model(all_preds, train_timestamps, n_params, split="train")
 
@@ -279,9 +219,7 @@ def main():
     val_features = np.nan_to_num(val_features, nan=0.0)
     val_features = _normalize(val_features)
 
-    with torch.no_grad():
-        X_val = torch.tensor(val_features, dtype=torch.float32)
-        val_preds = model(X_val).numpy() * PRED_SCALE
+    val_preds = model.predict(val_features) * PRED_SCALE
 
     val_result = evaluate_model(val_preds, val_timestamps, n_params, split="val")
 
