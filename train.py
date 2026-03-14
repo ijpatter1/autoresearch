@@ -10,6 +10,7 @@ import time
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.linear_model import Ridge
 
 from prepare import (
     FORWARD_HOURS,
@@ -122,19 +123,22 @@ def compute_targets(df: pd.DataFrame) -> np.ndarray:
 # Model
 # ---------------------------------------------------------------------------
 
-_trained_model = None
+_trained_gbr = None
+_trained_ridge = None
+_trained_model = None  # kept for interface compatibility
 
 
 def count_model_params(model=None) -> int:
-    """Return approximate parameter count for the GBR model."""
-    if model is None:
-        model = _trained_model
-    if model is None:
-        return 0
+    """Return approximate parameter count for the ensemble."""
     n_params = 0
-    for estimators in model.estimators_:
-        for tree in estimators:
-            n_params += tree.tree_.node_count
+    gbr = _trained_gbr
+    if gbr is not None:
+        for estimators in gbr.estimators_:
+            for tree in estimators:
+                n_params += tree.tree_.node_count
+    ridge = _trained_ridge
+    if ridge is not None:
+        n_params += ridge.coef_.size + 1
     return n_params
 
 
@@ -165,11 +169,13 @@ def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     features, timestamps = compute_features(df)
     features = np.nan_to_num(features, nan=0.0)
 
-    model = _trained_model
-    if model is None:
+    if _trained_gbr is None or _trained_ridge is None:
         raise RuntimeError("Model not trained. Run train.py first.")
 
-    preds = model.predict(features) * PRED_SCALE
+    features_norm = _normalize(features)
+    gbr_preds = _trained_gbr.predict(features) * PRED_SCALE
+    ridge_preds = _trained_ridge.predict(features_norm) * PRED_SCALE
+    preds = 0.7 * gbr_preds + 0.3 * ridge_preds
     return preds, timestamps
 
 
@@ -205,23 +211,16 @@ def main():
 
     features = np.nan_to_num(features, nan=0.0)
 
-    # Compute vol-based sample weights: upweight high-vol periods
-    # so model learns to be more accurate during crashes
-    close = train_df["close"].values.astype(np.float64)
-    hourly_ret = np.zeros(len(close))
-    hourly_ret[1:] = close[1:] / close[:-1] - 1.0
-    vol_168 = pd.Series(hourly_ret).rolling(168, min_periods=168).std().values
-    vol_168 = vol_168[MAX_LOOKBACK:][valid]
-    vol_168 = np.nan_to_num(vol_168, nan=np.nanmean(vol_168))
-    sample_weights = vol_168 / np.mean(vol_168)
-
     print(f"  Training samples: {len(features)}, Features: {features.shape[1]}")
 
-    # --- Train GBR ---
-    print("Training GBR...")
+    # Z-score normalize features for Ridge
+    features_norm = _normalize(features, fit=True)
+
+    # --- Train GBR + Ridge ensemble ---
+    print("Training GBR + Ridge ensemble...")
     train_start = time.time()
 
-    model = GradientBoostingRegressor(
+    gbr = GradientBoostingRegressor(
         n_estimators=300,
         max_depth=3,
         learning_rate=0.01,
@@ -231,18 +230,25 @@ def main():
         loss="squared_error",
         random_state=42,
     )
-    model.fit(features, targets, sample_weight=sample_weights)
+    gbr.fit(features, targets)
+
+    ridge = Ridge(alpha=1.0)
+    ridge.fit(features_norm, targets)
 
     training_seconds = time.time() - train_start
     print(f"Training complete in {training_seconds:.1f}s")
 
-    _trained_model = model
-    n_params = count_model_params(model)
-    print(f"  Model parameters (node count): {n_params}")
+    _trained_gbr = gbr
+    _trained_ridge = ridge
+    _trained_model = gbr  # for interface compatibility
+    n_params = count_model_params()
+    print(f"  Model parameters: {n_params}")
 
     # --- Evaluate on train split ---
     print("Evaluating on training data...")
-    all_preds = model.predict(features) * PRED_SCALE
+    gbr_preds = gbr.predict(features) * PRED_SCALE
+    ridge_preds = ridge.predict(features_norm) * PRED_SCALE
+    all_preds = 0.7 * gbr_preds + 0.3 * ridge_preds
 
     train_result = evaluate_model(all_preds, train_timestamps, n_params, split="train")
 
@@ -252,7 +258,10 @@ def main():
     val_features, val_timestamps = compute_features(val_df)
     val_features = np.nan_to_num(val_features, nan=0.0)
 
-    val_preds = model.predict(val_features) * PRED_SCALE
+    val_features_norm = _normalize(val_features)
+    val_gbr_preds = gbr.predict(val_features) * PRED_SCALE
+    val_ridge_preds = ridge.predict(val_features_norm) * PRED_SCALE
+    val_preds = 0.7 * val_gbr_preds + 0.3 * val_ridge_preds
 
     val_result = evaluate_model(val_preds, val_timestamps, n_params, split="val")
 
