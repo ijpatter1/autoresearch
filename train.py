@@ -160,6 +160,11 @@ def _normalize(features: np.ndarray, fit: bool = False) -> np.ndarray:
 # Prediction helper (used by prepare.py --evaluate-holdout)
 # ---------------------------------------------------------------------------
 
+def _smooth_predictions(raw_preds: np.ndarray) -> np.ndarray:
+    """Apply 48h rolling mean to smooth noisy tree-based predictions."""
+    return pd.Series(raw_preds).rolling(48, min_periods=1).mean().values
+
+
 def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     """Generate predictions on arbitrary OHLCV data."""
     features, timestamps = compute_features(df)
@@ -169,7 +174,7 @@ def predict_on_data(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
     if model is None:
         raise RuntimeError("Model not trained. Run train.py first.")
 
-    preds = model.predict(features) * PRED_SCALE
+    preds = _smooth_predictions(model.predict(features)) * PRED_SCALE
     return preds, timestamps
 
 
@@ -215,7 +220,7 @@ def main():
         n_estimators=300,
         max_depth=3,
         learning_rate=0.01,
-        subsample=0.9,
+        subsample=0.8,
         min_samples_leaf=100,
         max_features=0.8,
         loss="squared_error",
@@ -232,7 +237,7 @@ def main():
 
     # --- Evaluate on train split ---
     print("Evaluating on training data...")
-    all_preds = model.predict(features) * PRED_SCALE
+    all_preds = _smooth_predictions(model.predict(features)) * PRED_SCALE
 
     train_result = evaluate_model(all_preds, train_timestamps, n_params, split="train")
 
@@ -242,7 +247,7 @@ def main():
     val_features, val_timestamps = compute_features(val_df)
     val_features = np.nan_to_num(val_features, nan=0.0)
 
-    val_preds = model.predict(val_features) * PRED_SCALE
+    val_preds = _smooth_predictions(model.predict(val_features)) * PRED_SCALE
 
     val_result = evaluate_model(val_preds, val_timestamps, n_params, split="val")
 
