@@ -49,24 +49,37 @@ These approaches are explicitly prohibited. If you find yourself doing any of th
 
 4. **No signal function factories.** Do not write functions like `make_momentum_fn(scale)` or `make_mean_reversion_fn(lookback, threshold)` and loop over thousands of parameter combinations. The experiment loop across git commits is what provides exploration — not a search loop within a single run.
 
-5. **No post-hoc prediction scaling.** Do not multiply predictions by constants (e.g. `preds *= 0.8`) to change how many trades trigger. `PRED_SCALE` is a fixed constant in `prepare.py` — do not redefine it in `train.py`. If predictions are systematically too large or too small, fix the model (target normalization, loss function, architecture), not the output.
-
-6. **No hardcoded regime filters.** Do not apply if/else logic to predictions after the model produces them (e.g. zeroing out shorts, flattening during drawdowns, scaling by volatility). The model already has features that encode this information — rolling drawdown, volatility, returns at various lookbacks. Let it learn when to go flat. A post-processing function that overrides model output with hand-coded rules is domain-knowledge injection, not learning.
-
 The spirit of these rules: the 2-minute training budget should be spent **training a model** (fitting weights to data), not evaluating thousands of pre-built strategies.
+
+## Permitted output processing
+
+These techniques are explicitly allowed because they are standard architectural choices, not domain-knowledge injection:
+
+- **Output smoothing.** Applying a rolling average or exponential moving average to model predictions is permitted. This is functionally equivalent to a learned low-pass filter or `nn.AvgPool1d` layer — it reduces noise from discontinuous model outputs (e.g. tree-based models). A 24-48h smoothing window is reasonable.
+- **Target normalization and denormalization.** Training on transformed targets (e.g. vol-normalized returns: `forward_return / vol_168h`) and inverse-transforming predictions at inference time is permitted. This is standard preprocessing, same as winsorization or log-transforming targets for regression.
+- **Learned intercepts and biases.** If the model architecture includes a bias term or intercept that is learned during training, that's fine — it's a model parameter.
+
+These techniques are **still prohibited:**
+
+- **Hardcoded directional biases.** Adding a constant like `preds += 0.002` is fitting an intercept by hand. If the model needs a directional bias, it should learn one through asymmetric loss functions or target engineering, not through a hardcoded offset.
+- **Hardcoded regime filters.** Rules like "go flat when 168h return < -15%" or "never go short" are structural bets on market behavior that bypass the model. If the model should avoid shorts or reduce exposure during crashes, it should learn this from features (e.g. rolling drawdown features, volatility features) and training signal (e.g. asymmetric loss that penalizes short-side errors more heavily).
 
 ## The goal
 
 **Get the highest score.** The score is a composite metric: Sharpe ratio penalized for model complexity, insufficient trades, excessive drawdown, and inconsistent performance across time periods. Higher is better.
 
-**Score components:**
+**Score components** — all penalties are continuous (no hard cutoffs):
 - Base: annualized Sharpe ratio of the backtested strategy
-- Hard penalties (score → 0): fewer than 30 trades, max drawdown > 25%, unprofitable in too many subperiods
-- Soft penalty: parameter count (simpler models score higher, all else equal)
+- Drawdown penalty: full credit up to 10% max drawdown, smooth quadratic decay beyond (20% → 0.69x, 30% → 0.36x, 50% → 0.12x)
+- Trade count: linear ramp from 0 to 1 over [0, 50] trades (10 trades → 0.2x, 25 trades → 0.5x, 50+ → full credit)
+- Consistency: fraction of subperiods that are profitable (3/3 → 1.0x, 2/3 → 0.67x, 1/3 → 0.33x)
+- Parameter count: gentle complexity penalty (1K → 0.99x, 10K → 0.91x, 100K → 0.50x)
+
+Every experiment produces a meaningful score — there are no cliffs that zero out results. Even a poor strategy gives you a gradient to learn from.
 
 **Validation pass/fail:** After training, the model is also evaluated on a held-out validation period. You see only `val_pass: true` or `val_pass: false`. You do NOT see the actual validation metrics. An experiment should only be kept if BOTH score improved AND val_pass is true.
 
-**Baseline context**: The naive baseline scores 0.0 due to negative Sharpe and excessive drawdown (hard penalties zero out the score). This is expected and normal. Your first objective is achieving a positive score — this means getting positive Sharpe AND keeping max drawdown under 25% AND having at least 30 trades AND being profitable in at least 2 of 3 training subperiods. Improving prediction quality through better features and model architecture is the path forward.
+**Baseline context**: The initial baseline may score poorly due to negative Sharpe or high drawdown. Your first objective is achieving a positive score — this means positive Sharpe with reasonable drawdown, enough trades, and profitability across subperiods. Improving prediction quality through better features and model architecture is the path forward.
 
 ## Simplicity criterion
 
@@ -93,18 +106,23 @@ Explore these roughly in order of complexity. Don't skip ahead to exotic approac
 - Rolling z-scores of returns (mean-reversion signals)
 - Price relative to moving averages (trend signals)
 
-**Loss functions:**
-- MSE on forward returns (baseline)
+**Loss functions** (high priority — the default MSE has known problems):
+- MSE on forward returns (baseline — but centers predictions around zero, missing directional drift)
 - Huber loss for robustness to outliers
-- Asymmetric loss that penalizes wrong-direction predictions more heavily
-- Directional accuracy loss (predict sign correctly)
+- **Asymmetric loss**: penalize wrong-direction predictions more heavily. Specifically, when the model predicts down but the market goes up, apply 2-3x the loss weight. This lets the model learn directional bias from data rather than hardcoding it. Implement via sample weights or a custom loss function.
+- Directional accuracy loss: weight samples by the absolute magnitude of the actual return, so the model focuses on getting big moves right rather than minimizing MSE on noise.
 - Custom Sharpe-aware or downside-risk-aware objectives
+
+**Target engineering** (high priority — can change what the model learns):
+- **Vol-normalized targets**: train on `forward_return / vol_168h` (returns in sigma-space), denormalize at prediction time by multiplying by current vol. This makes the model naturally cautious in high-vol regimes and more aggressive in low-vol regimes.
+- **Excess returns**: train on `forward_return - rolling_mean_return` instead of raw returns. The rolling mean captures directional drift; the model learns deviations from it.
+- Winsorization at different thresholds (±3%, ±5%, ±10%)
 
 **Architectures** (try in order):
 - Linear regression / ridge regression (surprisingly strong baseline)
 - Small feedforward networks (2-3 layers, 16-64 units)
-- Gradient boosted trees (scikit-learn GradientBoostingRegressor)
-- LSTM / GRU for temporal patterns
+- Gradient boosted trees (scikit-learn GradientBoostingRegressor) — note: tree outputs are step functions that change discontinuously, generating many trades. Output smoothing (see Permitted output processing) helps significantly.
+- **LSTM / GRU for temporal patterns** — the recurrent hidden state produces temporally coherent predictions that evolve smoothly, solving the flip-flopping problem architecturally without needing output smoothing. Start with a small single-layer LSTM (32-64 units) with aggressive dropout. Harder to train but addresses a fundamental limitation of tree and feedforward models.
 - 1D-CNN for local pattern detection
 - Ensembles combining diverse model types
 
