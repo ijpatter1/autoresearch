@@ -8,7 +8,7 @@ data:
   fetch_retry_delay_seconds: 60
 
 model:
-  artifact_path: artifacts/model_8619431.joblib
+  artifact_path: artifacts/model_943751e.joblib
   scale_factor: 0.35
   ema_span: 20
 
@@ -33,6 +33,16 @@ alerts:
   drawdown_threshold: -0.10
   prediction_sanity_threshold: 2.0
   model_staleness_days: 30
+
+funding:
+  model_funding_cost: true        # apply funding rate to P&L
+  funding_rate_source: kraken     # use kraken funding_rate from parquet
+
+bip_tracking:
+  enabled: true
+  contract_size: 0.01             # BTC per contract
+  fee_per_contract: 0.46          # USD (exchange + commission + clearing + NFA)
+  slippage_bps: 5.0
 
 supplementary:
   orderbook_path: data/orderbook_1h.parquet

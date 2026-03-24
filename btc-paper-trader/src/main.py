@@ -11,6 +11,7 @@ Exit codes:
 """
 
 import argparse
+import fcntl
 import logging
 import os
 import sys
@@ -20,7 +21,15 @@ from pathlib import Path
 import yaml
 
 from .alerts import run_health_checks, write_alerts
-from .data import append_candle, fetch_latest_candle, fetch_latest_funding, load_parquet, save_parquet
+from .data import (
+    append_candle,
+    backfill_recent_gap,
+    fetch_latest_candle,
+    fetch_latest_funding,
+    load_parquet,
+    save_parquet,
+    validate_candle,
+)
 from .inference import InferenceResult, compute_position, load_artifacts, run_inference, validate_artifacts
 from .logging_config import (
     append_daily_summary,
@@ -47,41 +56,84 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
+def _acquire_lock(lock_path: str):
+    """Acquire an exclusive file lock. Returns file handle or None if locked."""
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fh.write(str(os.getpid()))
+        fh.flush()
+        return fh
+    except OSError:
+        fh.close()
+        return None
+
+
 def run_hourly(config: dict) -> int:
     """Execute the hourly inference pipeline.
 
     Returns exit code: 0=success, 1=data fetch failed, 2=inference failed.
     """
+    # Prevent concurrent runs
+    lock_path = os.path.join(os.path.dirname(config["data"]["parquet_path"]), ".lockfile")
+    lock_fh = _acquire_lock(lock_path)
+    if lock_fh is None:
+        logger.warning("Another run is in progress (lock held), exiting")
+        return 0
+
+    try:
+        return _run_hourly_inner(config)
+    finally:
+        fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        lock_fh.close()
+
+
+def _run_hourly_inner(config: dict) -> int:
+    """Inner hourly pipeline (called with lock held)."""
     start_time = time.time()
     data_cfg = config["data"]
     model_cfg = config["model"]
     trading_cfg = config["trading"]
     log_cfg = config["logging"]
 
+    def elapsed():
+        return f"[{time.time() - start_time:.1f}s]"
+
+    logger.info(f"{elapsed()} === Hourly run starting ===")
+
     # --- Load model artifacts ---
     artifact_path = model_cfg["artifact_path"]
-    logger.info(f"Loading artifacts from {artifact_path}")
     try:
         artifacts = load_artifacts(artifact_path)
         if not validate_artifacts(artifacts):
-            logger.error("Artifact validation failed")
+            logger.error(f"{elapsed()} Artifact validation failed")
             return 2
-        logger.info(
-            f"Artifacts loaded: commit={artifacts['commit']}, "
-            f"trained_at={artifacts['trained_at']}"
-        )
+        logger.info(f"{elapsed()} Artifacts loaded: commit={artifacts['commit']}")
     except Exception as e:
-        logger.error(f"Failed to load artifacts: {e}")
+        logger.error(f"{elapsed()} Failed to load artifacts: {e}")
         return 2
 
     # --- Load historical data ---
     parquet_path = data_cfg["parquet_path"]
     try:
         df = load_parquet(parquet_path)
-        logger.info(f"Loaded {len(df)} rows from {parquet_path}")
+        logger.info(f"{elapsed()} Parquet loaded: {len(df)} rows")
     except Exception as e:
-        logger.error(f"Failed to load parquet: {e}")
+        logger.error(f"{elapsed()} Failed to load parquet: {e}")
         return 2
+
+    # --- Backfill gap if data is stale ---
+    latest_ts = df["timestamp"].max()
+    import pandas as pd
+    gap_hours = (pd.Timestamp.now("UTC").tz_localize(None) - latest_ts).total_seconds() / 3600
+    if gap_hours > 2:
+        logger.info(f"{elapsed()} Data gap: {gap_hours:.0f}h since {latest_ts}. Backfilling...")
+        df = backfill_recent_gap(
+            df, symbol=data_cfg["symbol"], base_url=data_cfg["binance_base_url"],
+        )
+        save_parquet(df, parquet_path)
+        logger.info(f"{elapsed()} Backfill complete: {len(df)} rows")
 
     # --- Fetch latest candle ---
     candle = fetch_latest_candle(
@@ -91,10 +143,15 @@ def run_hourly(config: dict) -> int:
         retry_delay=data_cfg.get("fetch_retry_delay_seconds", 60),
     )
     if candle is None:
-        logger.warning("Failed to fetch latest candle")
+        logger.warning(f"{elapsed()} Failed to fetch latest candle")
         return 1
 
-    logger.info(f"Fetched candle: {candle['timestamp']} close={candle['close']:.2f}")
+    # Validate candle data
+    issues = validate_candle(candle)
+    if issues:
+        logger.warning(f"{elapsed()} Bad candle rejected: {'; '.join(issues)}")
+        return 1
+    logger.info(f"{elapsed()} Candle: {candle['timestamp']} close=${candle['close']:.2f}")
 
     # --- Fetch funding rate (from Kraken Futures) ---
     funding_result = fetch_latest_funding(
@@ -102,26 +159,28 @@ def run_hourly(config: dict) -> int:
         kraken_symbol=data_cfg.get("kraken_symbol", "PF_XBTUSD"),
     )
     funding_rate = funding_result[0] if funding_result else None
-    if funding_rate is not None:
-        logger.info(f"Funding rate: {funding_rate:.6f}")
+    logger.info(f"{elapsed()} Funding rate: {funding_rate:.6f}" if funding_rate else f"{elapsed()} Funding rate: forward-fill")
 
     # --- Append to DataFrame and save ---
+    prev_len = len(df)
     df = append_candle(df, candle, funding_rate)
     save_parquet(df, parquet_path)
-    logger.info(f"Parquet updated: {len(df)} rows")
+    new_rows = len(df) - prev_len
+    logger.info(f"{elapsed()} Parquet saved: {len(df)} rows ({'+' + str(new_rows) if new_rows else 'dedup'})")
 
     # --- Fetch supplementary data (non-critical) ---
     _fetch_supplementary(config, candle["close"])
 
     # --- Run inference ---
+    logger.info(f"{elapsed()} Running inference on {len(df)} rows...")
     try:
         result = run_inference(df, artifacts)
         logger.info(
-            f"Inference: pred_final={result.pred_final:.4f}, "
+            f"{elapsed()} Inference done: pred_final={result.pred_final:.4f}, "
             f"position={result.position:.2f}"
         )
     except Exception as e:
-        logger.error(f"Inference failed: {e}", exc_info=True)
+        logger.error(f"{elapsed()} Inference failed: {e}", exc_info=True)
         return 2
 
     # --- Update portfolio ---
@@ -134,12 +193,29 @@ def run_hourly(config: dict) -> int:
         sigma_full=trading_cfg["sigma_full_position"],
     )
 
+    # Get current funding rate from the DataFrame for cost calculation
+    current_funding_rate = 0.0
+    if "funding_rate" in df.columns:
+        current_funding_rate = float(df["funding_rate"].iloc[-1])
+
     new_state, metrics = update_portfolio(
         state,
         new_position,
         candle["close"],
         fee_rate=trading_cfg["fee_rate"],
         slippage_rate=trading_cfg["slippage_rate"],
+        funding_rate=current_funding_rate,
+    )
+
+    # BIP fee tracking (parallel, doesn't affect P&L)
+    from .portfolio import compute_bip_fees
+    bip_cfg = config.get("bip_tracking", {})
+    bip = compute_bip_fees(
+        position_delta=metrics["position_delta"],
+        btc_price=candle["close"],
+        contract_size=bip_cfg.get("contract_size", 0.01),
+        fee_per_contract=bip_cfg.get("fee_per_contract", 0.46),
+        slippage_bps=bip_cfg.get("slippage_bps", 5.0),
     )
     save_portfolio_state(new_state, state_path)
 
@@ -170,8 +246,12 @@ def run_hourly(config: dict) -> int:
         "position_prev": metrics["position_prev"],
         "position_delta": metrics["position_delta"],
         "fee_cost": metrics["fee_cost"],
+        "funding_rate": metrics["funding_rate"],
+        "funding_cost": metrics["funding_cost"],
         "btc_price": candle["close"],
         "btc_return_1h": metrics["btc_return_1h"],
+        "bip_n_contracts": bip["n_contracts"],
+        "bip_fee_cost": bip["total_bip_cost"],
     }
     append_prediction_row(log_cfg["prediction_log"], pred_row)
 
@@ -213,8 +293,7 @@ def run_hourly(config: dict) -> int:
         for alert in alerts:
             logger.warning(f"ALERT: {alert}")
 
-    elapsed = time.time() - start_time
-    logger.info(f"Hourly run completed in {elapsed:.1f}s")
+    logger.info(f"{elapsed()} === Hourly run complete ===")
     return 0
 
 
