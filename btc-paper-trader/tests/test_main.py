@@ -256,7 +256,6 @@ class TestHourlyRunEndToEnd:
         monkeypatch.setattr(main_mod, "backfill_recent_gap", lambda df, **kw: df)
         monkeypatch.setattr(main_mod, "fetch_latest_candle", lambda **kw: dict(candle_T))
         monkeypatch.setattr(main_mod, "fetch_latest_funding", lambda **kw: None)
-        monkeypatch.setattr(main_mod, "_fetch_supplementary", lambda *a, **k: None)
 
         config = {
             "data": {"parquet_path": str(parquet_path), "symbol": "BTCUSDT",

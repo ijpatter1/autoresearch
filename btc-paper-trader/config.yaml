@@ -134,12 +134,25 @@ bip_tracking:
   fee_per_contract: 0.46          # USD (exchange + commission + clearing + NFA)
   slippage_bps: 5.0
 
-supplementary:
+archiver:
+  # Hardened supplementary capture (hardening spec WS7). Runs as its OWN systemd
+  # timer (btc-paper-trader-archiver.timer, hourly at :02), not inside the trading
+  # pipeline — in the audited record capture sat behind the candle fetch, so its
+  # coverage matched the pipeline's 65.4%, and unlike candles this data cannot be
+  # backfilled. Rows are keyed (venue, symbol, timestamp[UTC]) with schema_version
+  # and capture_status; an hour the archiver missed is written as an explicit
+  # 'gap' row by the next successful run, so absence is recorded, never inferred.
+  # The never-run liquidation websocket aggregator (src/liquidations.py) was
+  # deleted here per WS1 (wire it in or delete it); it is in git history if a
+  # future model iteration wants it.
   orderbook_path: data/orderbook_1h.parquet
   open_interest_path: data/open_interest_1h.parquet
-  # liquidations_path retired (WS1): the websocket aggregator (src/liquidations.py)
-  # has never run and produces no file, so this key pointed at nothing. Supplementary
-  # capture — including wiring liquidations onto the hardened scheduler — is WS7 (PR4).
+  # Adding a symbol is a config change, not a code change: each target captures
+  # its order book from data.binance_base_url and its open interest + funding
+  # from one Kraken Futures ticker call.
+  targets:
+    - symbol: BTCUSDT           # Binance US spot order book
+      kraken_symbol: PF_XBTUSD  # Kraken Futures open interest + funding
 
 reporting:
   daily_report_path: logs/daily_report.txt

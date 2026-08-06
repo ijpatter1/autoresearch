@@ -1,7 +1,7 @@
 # Deployment
 
-The trader runs as two systemd timers on an always-on Linux host — not cron on
-a laptop. This is the WS1 fix: the audited run lost 35% of its hours because
+The trader runs as three systemd timers on an always-on Linux host — not cron
+on a laptop. This is the WS1 fix: the audited run lost 35% of its hours because
 macOS cron does not fire during sleep, and the failure was invisible because
 nothing paged on absence.
 
@@ -17,30 +17,58 @@ Tally NFC tag-writer, so the trader:
 
 ## Layout
 
+The units pin `/opt/btc-paper-trader`, but this project is a **subdirectory of
+the repo**, so that path cannot be the clone itself. The deployed layout (as on
+the Pi since 2026-08-06) is a clone at `/opt/autoresearch` plus a symlink:
+
 | Path | What |
 |---|---|
-| `/opt/btc-paper-trader` | the checkout (pinned; the unit files hard-code this path) |
+| `/opt/autoresearch` | the repo clone |
+| `/opt/btc-paper-trader` | symlink -> `/opt/autoresearch/btc-paper-trader` (the path the unit files hard-code) |
 | `/opt/btc-paper-trader/.venv` | venv pinned by `uv.lock` |
-| `/opt/btc-paper-trader/artifacts/` | model artifact + parity sidecar (copied out of band; not in git) |
-| `/etc/btc-paper-trader/btc-paper-trader.env` | EnvironmentFile, mode 600 (holds `HEARTBEAT_PING_URL` once WS3 lands) |
+| `/opt/btc-paper-trader/artifacts/` | model artifact + **per-host** parity sidecar (copied/generated out of band; not in git) |
+| `/etc/btc-paper-trader/btc-paper-trader.env` | EnvironmentFile, mode 600 (holds `HEARTBEAT_PING_URL`) |
 | `/etc/systemd/system/btc-paper-trader*.{service,timer}` | installed verbatim from `deploy/systemd/` |
 
 ## Install
 
 ```bash
 # On the Pi, as a user with sudo:
-sudo git clone <repo> /opt/btc-paper-trader     # must be this exact path
-cd /opt/btc-paper-trader
-# Copy the model artifact + parity sidecar into artifacts/ (they are gitignored):
-#   scp artifacts/model_943751e.joblib artifacts/model_943751e.parity.json \
+sudo git clone <repo> /opt/autoresearch
+sudo ln -s /opt/autoresearch/btc-paper-trader /opt/btc-paper-trader
+# Copy the model artifact into artifacts/ (gitignored):
+#   scp artifacts/model_943751e.joblib \
 #       ijpatter1@ian-pi.local:/opt/btc-paper-trader/artifacts/
-sudo bash scripts/install_services.sh
+sudo bash /opt/btc-paper-trader/scripts/install_services.sh
 ```
+
+Two symlink gotchas, both hit on the first deploy:
+
+- Invoke the installer by **absolute path through the symlink**, as above. A
+  `cd` + relative path fails its location check: sudo scrubs `$PWD` and bash
+  re-derives the physical path (`/opt/autoresearch/btc-paper-trader`), which is
+  not the pinned one.
+- `chown -R` does **not** traverse the symlink. After the install and after
+  every `git pull`, re-own the physical tree:
+  `sudo chown -R btctrader:btctrader /opt/autoresearch/btc-paper-trader`.
 
 The installer creates the service user, syncs the venv from `uv.lock`
 (`uv sync --frozen` — an unpinned pip install is what let the environment
 drift), copies the unit files **verbatim**, verifies they are byte-identical to
 the repo, scaffolds the mode-600 EnvironmentFile, and enables the timers.
+
+Do not copy the laptop's parity sidecar: the `pred_final` byte hash it stores
+is host-specific (float64 last-bit differences across arm64 macOS vs aarch64
+Linux). Generate it on the Pi with `write_parity_sidecar`; the artifact's own
+reference-prediction check (WS4) is the authoritative cross-host guard.
+
+Updates:
+
+```bash
+sudo git -C /opt/autoresearch pull --ff-only
+sudo chown -R btctrader:btctrader /opt/autoresearch/btc-paper-trader
+sudo bash /opt/btc-paper-trader/scripts/install_services.sh   # re-sync venv + units if they changed
+```
 
 ## Verify
 
@@ -57,6 +85,7 @@ mismatch. Run it after every deploy.
 
 ## Scheduling and catch-up
 
+- `btc-paper-trader-archiver.timer` — hourly at `:02`, `Persistent=true`.
 - `btc-paper-trader.timer` — hourly at `:05`, `Persistent=true`.
 - `btc-paper-trader-report.timer` — daily at `00:15`, `Persistent=true`.
 
@@ -67,8 +96,33 @@ an already-processed hour changes nothing. A catch-up longer than
 `trading.max_catchup_hours` (default 168h) is clamped and logged; the earlier
 gap is left for WS2 frozen-gap tagging.
 
-The liquidation websocket aggregator is **not** installed here — supplementary
-capture is hardened in WS7 (PR4).
+## Supplementary archiver (WS7)
+
+`btc-paper-trader-archiver.timer` captures the order book snapshot (Binance US)
+and open interest + funding (Kraken Futures) at `:02` every hour, as its own
+service rather than a step of the trading pipeline. In the audited record,
+capture ran inside the pipeline behind the candle fetch, so its coverage
+matched the pipeline's 65.4% — and unlike candles, this data cannot be
+backfilled; every hour lost is lost permanently.
+
+Archive rows are keyed `(venue, symbol, timestamp)` — timestamps in UTC,
+matching the OHLCV series — with a `schema_version` and a `capture_status` of
+`captured` or `gap`. An hour the archiver missed (host down, fetch failed) is
+written as an explicit `gap` row by the next successful run, so coverage is
+queryable from the file itself rather than inferred from absences. Writes are
+atomic (temp + rename); a hard kill mid-write leaves the previous file intact.
+Symbols are added in `config.yaml` under `archiver.targets` — a config change,
+not a code change.
+
+On its first run the archiver upgrades the pre-WS7 parquets in place: stamps
+the key columns, converts the old host-local (America/New_York) timestamps to
+UTC, marks the historical gap hours, and keeps the originals once at
+`<file>.pre-ws7.bak`.
+
+The archiver logs to journald only (`journalctl -u
+btc-paper-trader-archiver.service`) and never pages: per the notification
+budget (D7), the heartbeat is the only page there is. Capture losses are
+visible as gap rows, not notifications.
 
 ## Monitoring (WS3)
 

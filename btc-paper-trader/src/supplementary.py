@@ -1,22 +1,27 @@
-"""Supplementary data collection: order book snapshots and open interest.
+"""Supplementary data fetchers: order book depth and derivatives state.
 
-Order book: Binance US spot (same data as training, US-accessible).
-Open interest: Kraken Futures (Binance Futures blocked in US).
+Order book: Binance US spot (same venue as the live OHLCV).
+Open interest + funding: Kraken Futures (Binance Futures blocked in US), one
+ticker call for both.
 
-These data sources are NOT used by the current model but are accumulated
-for future model iterations. Stored in separate parquet files.
+This data is NOT used by the current model; it is accumulated for future model
+iterations, and it cannot be backfilled. The fetchers return payload dicts
+only — no timestamps, no storage. Keying, scheduling, gap marking, and atomic
+parquet writes belong to src.archiver (hardening spec WS7).
 """
 
 import json
 import logging
-import os
 import zlib
 
 import numpy as np
-import pandas as pd
 import requests
 
 logger = logging.getLogger(__name__)
+
+# Kraken Futures funding rate is annualized absolute.
+# Convert to Binance-equivalent per-8h rate: rate / (365.25 * 3)
+_KRAKEN_ANNUAL_TO_8H = 1.0 / (365.25 * 3)
 
 
 def fetch_orderbook_snapshot(
@@ -82,7 +87,6 @@ def fetch_orderbook_snapshot(
     raw_compressed = zlib.compress(raw_json.encode(), level=6)
 
     return {
-        "timestamp": pd.Timestamp.now(tz=None).floor("h"),
         "mid_price": mid_price,
         "spread_bps": spread_bps,
         "bid_volume_0_5pct": bid_vol_05,
@@ -97,59 +101,47 @@ def fetch_orderbook_snapshot(
     }
 
 
-def fetch_open_interest(
+def fetch_derivatives_snapshot(
     kraken_futures_url: str = "https://futures.kraken.com",
     kraken_symbol: str = "PF_XBTUSD",
-    btc_price: float | None = None,
 ) -> dict | None:
-    """Fetch current open interest from Kraken Futures.
+    """Fetch open interest and funding from one Kraken Futures ticker call.
 
-    Returns dict with OI in BTC and USD, or None on failure.
+    Funding was previously only captured indirectly (forward-filled into the
+    OHLCV parquet by the pipeline); archiving it hourly at source keeps the
+    non-backfillable record whole (WS7). Returns dict or None on failure.
     """
     url = f"{kraken_futures_url}/derivatives/api/v3/tickers/{kraken_symbol}"
 
     try:
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
-        data = resp.json()
-        ticker = data.get("ticker", {})
+        ticker = resp.json().get("ticker", {})
     except Exception as e:
-        logger.warning(f"Open interest fetch failed: {e}")
+        logger.warning(f"Derivatives fetch failed: {e}")
         return None
 
-    oi = float(ticker.get("openInterest", 0))
-    # Use Kraken mark price if btc_price not provided
-    price = btc_price or float(ticker.get("markPrice", 0))
-    oi_usd = oi * price if price else 0.0
+    if not ticker:
+        logger.warning("Empty Kraken ticker response")
+        return None
+
+    def _finite(field):
+        try:
+            v = float(ticker[field])
+        except (KeyError, TypeError, ValueError):
+            return None
+        return v if np.isfinite(v) else None
+
+    oi = _finite("openInterest")
+    if oi is None:
+        logger.warning(f"Kraken openInterest not usable: {ticker.get('openInterest')!r}")
+        return None
+    mark = _finite("markPrice")
+    annual = _finite("fundingRate")
 
     return {
-        "timestamp": pd.Timestamp.now(tz=None).floor("h"),
         "open_interest": oi,
-        "open_interest_usd": oi_usd,
+        "open_interest_usd": oi * mark if mark else 0.0,
+        "funding_rate_annual": annual,
+        "funding_rate_8h": annual * _KRAKEN_ANNUAL_TO_8H if annual is not None else None,
     }
-
-
-def append_supplementary_row(path: str, row: dict) -> None:
-    """Append a row to a supplementary parquet file.
-
-    If the file doesn't exist, creates it. Uses atomic write.
-    """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    new_row_df = pd.DataFrame([row])
-
-    if os.path.exists(path):
-        existing = pd.read_parquet(path)
-        # Dedup by timestamp
-        if row["timestamp"] in existing["timestamp"].values:
-            logger.info(f"Supplementary row {row['timestamp']} already exists in {path}")
-            return
-        combined = pd.concat([existing, new_row_df], ignore_index=True)
-    else:
-        combined = new_row_df
-
-    combined = combined.sort_values("timestamp").reset_index(drop=True)
-
-    tmp_path = path + ".tmp"
-    combined.to_parquet(tmp_path, index=False)
-    os.replace(tmp_path, path)

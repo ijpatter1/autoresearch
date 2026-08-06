@@ -14,8 +14,14 @@ DEPLOY = Path(__file__).parent.parent / "deploy" / "systemd"
 INSTALL_DIR = "/opt/btc-paper-trader"
 SERVICE_USER = "btctrader"
 
-SERVICES = ["btc-paper-trader.service", "btc-paper-trader-report.service"]
-TIMERS = ["btc-paper-trader.timer", "btc-paper-trader-report.timer"]
+# unit -> the module its ExecStart must run
+SERVICES = {
+    "btc-paper-trader.service": "src.main",
+    "btc-paper-trader-report.service": "src.main",
+    "btc-paper-trader-archiver.service": "src.archiver",
+}
+TIMERS = ["btc-paper-trader.timer", "btc-paper-trader-report.timer",
+          "btc-paper-trader-archiver.timer"]
 
 
 def _parse(unit_name: str) -> configparser.ConfigParser:
@@ -25,7 +31,7 @@ def _parse(unit_name: str) -> configparser.ConfigParser:
     return cp
 
 
-@pytest.mark.parametrize("unit", SERVICES + TIMERS)
+@pytest.mark.parametrize("unit", list(SERVICES) + TIMERS)
 def test_unit_exists_and_parses(unit):
     assert (DEPLOY / unit).exists(), f"missing unit {unit}"
     cp = _parse(unit)
@@ -33,14 +39,14 @@ def test_unit_exists_and_parses(unit):
     assert cp.has_section("Install")
 
 
-@pytest.mark.parametrize("unit", SERVICES)
-def test_service_pins_path_user_and_venv(unit):
+@pytest.mark.parametrize("unit,module", SERVICES.items())
+def test_service_pins_path_user_and_venv(unit, module):
     cp = _parse(unit)
     svc = cp["Service"]
     assert svc["Type"] == "oneshot"
     assert svc["User"] == SERVICE_USER
     assert svc["WorkingDirectory"] == INSTALL_DIR
-    assert svc["ExecStart"].startswith(f"{INSTALL_DIR}/.venv/bin/python -m src.main")
+    assert svc["ExecStart"].startswith(f"{INSTALL_DIR}/.venv/bin/python -m {module}")
     # Confined to its own tree — must not roam the shared Pi.
     assert svc["ProtectSystem"] == "strict"
     assert INSTALL_DIR in svc["ReadWritePaths"]
@@ -59,8 +65,18 @@ def test_report_timer_daily():
     assert cp["Timer"]["OnCalendar"] == "*-*-* 00:15:00"
 
 
+def test_archiver_timer_fires_before_the_trader():
+    # :02, near the top of the hour so the snapshot represents its stamped
+    # hour, and independent of whatever the :05 trading run does (WS7).
+    cp = _parse("btc-paper-trader-archiver.timer")
+    timer = cp["Timer"]
+    assert timer["OnCalendar"] == "*-*-* *:02:00"
+    assert timer["Persistent"] == "true"
+
+
 def test_no_liquidations_service_shipped():
-    # The aggregator is deferred to WS7; nothing here should install it.
-    for unit in SERVICES + TIMERS:
+    # src/liquidations.py was deleted per WS1 (never ran; recoverable from git
+    # history) — nothing here should resurrect it.
+    for unit in list(SERVICES) + TIMERS:
         text = (DEPLOY / unit).read_text()
         assert "liquidation" not in text.lower()

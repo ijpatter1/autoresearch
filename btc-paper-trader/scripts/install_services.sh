@@ -4,14 +4,12 @@
 # installer, which only ran on macOS and never fired during sleep.
 #
 # What it installs:
-#   - btc-paper-trader.timer         hourly inference at :05, Persistent catch-up
-#   - btc-paper-trader-report.timer  daily report at 00:15 UTC
-# Both drive oneshot services running as a dedicated `btctrader` user from a
+#   - btc-paper-trader-archiver.timer  supplementary capture at :02 (WS7)
+#   - btc-paper-trader.timer           hourly inference at :05, Persistent catch-up
+#   - btc-paper-trader-report.timer    daily report at 00:15 UTC
+# All drive oneshot services running as a dedicated `btctrader` user from a
 # venv pinned by uv.lock. The unit files are copied VERBATIM from deploy/systemd
 # and verified byte-identical, so the deployment is reproducible from the repo.
-#
-# The liquidation aggregator is intentionally NOT installed here; supplementary
-# capture is hardened in WS7 (PR4).
 #
 # Usage (run as root on the Pi, from the pinned checkout path):
 #   sudo bash scripts/install_services.sh          # install / update
@@ -33,6 +31,8 @@ UNITS=(
     btc-paper-trader.timer
     btc-paper-trader-report.service
     btc-paper-trader-report.timer
+    btc-paper-trader-archiver.service
+    btc-paper-trader-archiver.timer
 )
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -114,7 +114,7 @@ check_units || fail "post-install unit verification failed"
 
 # --- Enable timers ---
 systemctl daemon-reload
-systemctl enable --now btc-paper-trader.timer btc-paper-trader-report.timer
+systemctl enable --now btc-paper-trader.timer btc-paper-trader-report.timer btc-paper-trader-archiver.timer
 echo "  Timers enabled and started"
 
 cat <<EOF
