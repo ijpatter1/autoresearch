@@ -1,81 +1,131 @@
 #!/bin/bash
-# Setup cron jobs and systemd service for the paper trader.
+# Install the BTC Paper Trader as systemd timers on the always-on Linux host
+# (hardening spec WS1). Replaces the previous cron + liquidation-websocket
+# installer, which only ran on macOS and never fired during sleep.
 #
-# Usage: bash scripts/install_services.sh
+# What it installs:
+#   - btc-paper-trader.timer         hourly inference at :05, Persistent catch-up
+#   - btc-paper-trader-report.timer  daily report at 00:15 UTC
+# Both drive oneshot services running as a dedicated `btctrader` user from a
+# venv pinned by uv.lock. The unit files are copied VERBATIM from deploy/systemd
+# and verified byte-identical, so the deployment is reproducible from the repo.
 #
-# Creates:
-#   1. Hourly cron at :05 for main inference pipeline
-#   2. Daily cron at 00:15 UTC for report generation
-#   3. systemd service for liquidation websocket aggregator
+# The liquidation aggregator is intentionally NOT installed here; supplementary
+# capture is hardened in WS7 (PR4).
+#
+# Usage (run as root on the Pi, from the pinned checkout path):
+#   sudo bash scripts/install_services.sh          # install / update
+#   sudo bash scripts/install_services.sh --check   # verify byte-identical units only
+#
+# Pi note (shared host): this touches only its own user, venv, unit files, and
+# /etc/btc-paper-trader. It does not run raspi-config and does not modify serial,
+# UART, or Bluetooth configuration that the Tally tag-writer depends on.
 
-set -e
+set -euo pipefail
+
+INSTALL_DIR="/opt/btc-paper-trader"     # pinned: must match WorkingDirectory in the units
+SERVICE_USER="btctrader"
+ENV_DIR="/etc/btc-paper-trader"
+ENV_FILE="${ENV_DIR}/btc-paper-trader.env"
+SYSTEMD_DIR="/etc/systemd/system"
+UNITS=(
+    btc-paper-trader.service
+    btc-paper-trader.timer
+    btc-paper-trader-report.service
+    btc-paper-trader-report.timer
+)
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PYTHON="${SCRIPT_DIR}/.venv/bin/python"
+MODE="${1:-install}"
 
-if [ ! -f "$PYTHON" ]; then
-    echo "Error: Python venv not found at $PYTHON"
-    echo "Create it first: python3 -m venv .venv && .venv/bin/pip install -e ."
-    exit 1
+fail() { echo "ERROR: $*" >&2; exit 1; }
+
+# --- Verify units in the repo are byte-identical to what is (or would be) deployed ---
+check_units() {
+    local ok=1
+    for unit in "${UNITS[@]}"; do
+        local src="${SCRIPT_DIR}/deploy/systemd/${unit}"
+        local dst="${SYSTEMD_DIR}/${unit}"
+        [ -f "$src" ] || fail "missing repo unit: $src"
+        if [ ! -f "$dst" ]; then
+            echo "  $unit: not yet installed"
+            ok=0
+        elif cmp -s "$src" "$dst"; then
+            echo "  $unit: byte-identical"
+        else
+            echo "  $unit: DIFFERS from repo"
+            ok=0
+        fi
+    done
+    return $((ok == 1 ? 0 : 1))
+}
+
+if [ "$MODE" = "--check" ]; then
+    echo "Checking deployed units against repo..."
+    check_units && echo "All units byte-identical." || fail "unit drift detected"
+    exit 0
 fi
 
-echo "Setting up paper trader services..."
-echo "  Project dir: $SCRIPT_DIR"
-echo "  Python: $PYTHON"
+# --- Preconditions ---
+[ "$(id -u)" -eq 0 ] || fail "must run as root (use sudo)"
+command -v systemctl >/dev/null 2>&1 || fail "systemd not found; this installer targets a Linux host"
+if [ "$SCRIPT_DIR" != "$INSTALL_DIR" ]; then
+    fail "checkout is at $SCRIPT_DIR but the units pin $INSTALL_DIR.
+       Clone the repo to $INSTALL_DIR (or adjust deploy/systemd/*.service) and re-run."
+fi
 
-# --- 1. Cron jobs ---
-echo ""
-echo "Installing cron jobs..."
+echo "Installing BTC Paper Trader services..."
+echo "  Install dir:  $INSTALL_DIR"
+echo "  Service user: $SERVICE_USER"
 
-# Remove any existing paper trader cron entries
-EXISTING_CRON=$(crontab -l 2>/dev/null | grep -v "btc-paper-trader" || true)
+# --- Service user (system account, no login shell) ---
+if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+    useradd --system --home-dir "$INSTALL_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
+    echo "  Created service user $SERVICE_USER"
+fi
 
-# Add hourly inference (minute :05) and daily report (00:15 UTC)
-NEW_CRON="$EXISTING_CRON
-# BTC Paper Trader — hourly inference
-5 * * * * cd $SCRIPT_DIR && $PYTHON -m src.main >> logs/cron.log 2>&1
-# BTC Paper Trader — daily report (00:15 UTC)
-15 0 * * * cd $SCRIPT_DIR && $PYTHON -m src.main --report >> logs/cron.log 2>&1"
+# --- Python venv pinned by uv.lock ---
+if command -v uv >/dev/null 2>&1; then
+    ( cd "$INSTALL_DIR" && uv sync --frozen )
+    echo "  Synced venv from uv.lock (frozen)"
+else
+    fail "uv not found. Install uv (https://docs.astral.sh/uv/) so the venv is
+       pinned by uv.lock; an unpinned pip install is what let the env drift."
+fi
 
-echo "$NEW_CRON" | crontab -
-echo "  Cron jobs installed"
+# --- Data/log dirs and ownership ---
+mkdir -p "$INSTALL_DIR/data" "$INSTALL_DIR/logs"
+chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
 
-# --- 2. Liquidation websocket systemd service ---
-echo ""
-echo "Installing liquidation aggregator service..."
+# --- EnvironmentFile scaffold (mode 600, owned by the service user) ---
+mkdir -p "$ENV_DIR"
+if [ ! -f "$ENV_FILE" ]; then
+    install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 600 \
+        "${SCRIPT_DIR}/deploy/btc-paper-trader.env.example" "$ENV_FILE"
+    echo "  Scaffolded $ENV_FILE (mode 600) — populate HEARTBEAT_PING_URL when WS3 lands"
+fi
 
-SERVICE_FILE="/etc/systemd/system/btc-liquidations.service"
+# --- Unit files: copy verbatim, then verify byte-identical ---
+for unit in "${UNITS[@]}"; do
+    install -m 644 "${SCRIPT_DIR}/deploy/systemd/${unit}" "${SYSTEMD_DIR}/${unit}"
+done
+echo "  Installed ${#UNITS[@]} unit files"
+check_units || fail "post-install unit verification failed"
 
-sudo tee "$SERVICE_FILE" > /dev/null << EOF
-[Unit]
-Description=BTC Paper Trader — Liquidation Websocket Aggregator
-After=network-online.target
-Wants=network-online.target
+# --- Enable timers ---
+systemctl daemon-reload
+systemctl enable --now btc-paper-trader.timer btc-paper-trader-report.timer
+echo "  Timers enabled and started"
 
-[Service]
-Type=simple
-WorkingDirectory=$SCRIPT_DIR
-ExecStart=$PYTHON -m src.liquidations --config config.yaml
-Restart=always
-RestartSec=10
-User=$(whoami)
+cat <<EOF
 
-# Logging
-StandardOutput=append:$SCRIPT_DIR/logs/liquidations.log
-StandardError=append:$SCRIPT_DIR/logs/liquidations.log
+Setup complete. Verify with:
+  systemctl list-timers 'btc-paper-trader*'      # next fire times
+  systemctl status btc-paper-trader.service       # last run
+  journalctl -u btc-paper-trader.service -n 50     # run logs
+  sudo bash scripts/install_services.sh --check    # unit files still byte-identical
 
-[Install]
-WantedBy=multi-user.target
+The model artifact and its parity sidecar are NOT in git; copy them to
+$INSTALL_DIR/artifacts/ out of band, then confirm the environment:
+  cd $INSTALL_DIR && uv run scripts/verify_environment.py
 EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable btc-liquidations
-sudo systemctl start btc-liquidations
-
-echo "  Liquidation service installed and started"
-
-echo ""
-echo "Setup complete. Verify with:"
-echo "  crontab -l                           # Check cron jobs"
-echo "  sudo systemctl status btc-liquidations  # Check websocket service"
-echo "  tail -f logs/system.log              # Monitor hourly runs"

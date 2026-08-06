@@ -21,6 +21,9 @@
     ],
     "defaultMode": "bypassPermissions"
   },
+  "enabledPlugins": {
+    "guv@guv": false
+  },
   "hooks": {
     "PreToolUse": [
       {

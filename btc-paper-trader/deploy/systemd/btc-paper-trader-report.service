@@ -1,0 +1,21 @@
+[Unit]
+Description=BTC Paper Trader - daily report
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=btctrader
+Group=btctrader
+WorkingDirectory=/opt/btc-paper-trader
+EnvironmentFile=-/etc/btc-paper-trader/btc-paper-trader.env
+ExecStart=/opt/btc-paper-trader/.venv/bin/python -m src.main --report
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/btc-paper-trader/data /opt/btc-paper-trader/logs
+
+[Install]
+WantedBy=multi-user.target

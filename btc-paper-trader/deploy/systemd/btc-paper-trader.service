@@ -1,0 +1,31 @@
+[Unit]
+Description=BTC Paper Trader - hourly inference run
+Documentation=file:/opt/btc-paper-trader/hardening-spec.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=btctrader
+Group=btctrader
+WorkingDirectory=/opt/btc-paper-trader
+# Optional (leading '-'): holds HEARTBEAT_PING_URL once WS3 lands. Absent is fine for now.
+EnvironmentFile=-/etc/btc-paper-trader/btc-paper-trader.env
+ExecStart=/opt/btc-paper-trader/.venv/bin/python -m src.main
+
+# A timer-driven oneshot does not use Restart=: periodicity and retry both come
+# from the timer (a failed run is retried by the next tick; Persistent=true
+# replays runs missed while the host was off). Transient fetch failures are
+# already retried inside the run itself.
+
+# Sandboxing: the trader shares the Pi with the Tally tag-writer, so it is
+# confined to its own tree and may not touch the serial/UART/Bluetooth config
+# Tally depends on.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/btc-paper-trader/data /opt/btc-paper-trader/logs
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,5 @@
+PYTHONWARNINGS=ignore::sklearn.exceptions.InconsistentVersionWarning
+LOKY_MAX_CPU_COUNT=4
+PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+5 * * * * cd /Users/ipatterson/dev/autoresearch/btc-paper-trader && /Users/ipatterson/dev/autoresearch/btc-paper-trader/.venv/bin/python -m src.main >> /Users/ipatterson/dev/autoresearch/btc-paper-trader/logs/cron.log 2>&1
+15 23 * * * cd /Users/ipatterson/dev/autoresearch/btc-paper-trader && /Users/ipatterson/dev/autoresearch/btc-paper-trader/.venv/bin/python -m src.main --report >> /Users/ipatterson/dev/autoresearch/btc-paper-trader/logs/cron.log 2>&1

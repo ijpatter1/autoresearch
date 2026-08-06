@@ -6,11 +6,28 @@ data:
   kraken_symbol: PF_XBTUSD
   fetch_retry_attempts: 3
   fetch_retry_delay_seconds: 60
+  # Venue provenance (hardening spec WS8). The series changed venue at
+  # 2026-03-01 (binance_com -> binance_us). primary_venue is the live source;
+  # any append or backfill of a different venue is refused unless the override
+  # below is set. Run scripts/migrate_add_venue.py once to stamp existing rows.
+  primary_venue: binance_us
+  allow_venue_mismatch: false
 
 model:
   artifact_path: artifacts/model_943751e.joblib
   scale_factor: 0.35
   ema_span: 20
+
+integrity:
+  # Startup environment-integrity checks (hardening spec WS4). The artifact's
+  # stored reference predictions are recomputed under the running environment
+  # every startup; a mismatch means the models no longer behave as exported.
+  enforce: true               # false = log-only diagnostic mode (never refuse to run)
+  reference_atol: 1.0e-6      # max |diff| tolerated when reproducing reference predictions
+  # Only consulted when reference predictions still match. warn = benign skew
+  # (default, per audit: 1.7.2 -> 1.8.0 reproduces bit-exactly); fatal = refuse;
+  # ignore = say nothing.
+  on_version_mismatch: warn
 
 trading:
   sigma_threshold: 0.20
@@ -18,6 +35,10 @@ trading:
   fee_rate: 0.001
   slippage_rate: 0.0005
   starting_portfolio_value: 1.0
+  # On resume after an outage, book each missed hour individually (WS1). A gap
+  # longer than this is clamped to the most recent window and the truncation is
+  # logged; the earlier gap is left for WS2 frozen-gap tagging.
+  max_catchup_hours: 168
 
 logging:
   prediction_log: logs/predictions.csv
@@ -47,13 +68,19 @@ bip_tracking:
 supplementary:
   orderbook_path: data/orderbook_1h.parquet
   open_interest_path: data/open_interest_1h.parquet
-  liquidations_path: data/liquidations_1h.parquet
+  # liquidations_path retired (WS1): the websocket aggregator (src/liquidations.py)
+  # has never run and produces no file, so this key pointed at nothing. Supplementary
+  # capture — including wiring liquidations onto the hardened scheduler — is WS7 (PR4).
 
 reporting:
   daily_report_path: logs/daily_report.txt
-  delivery_method: telegram  # file | email | telegram | slack
-  telegram_bot_token: ${TELEGRAM_BOT_TOKEN}  # env var
-  telegram_chat_id: ${TELEGRAM_CHAT_ID}      # env var
+  # Disabled 2026-08-06: telegram delivery 404'd on all 83 attempts since
+  # inception — YAML does not expand ${VAR}, so the literal placeholder was
+  # posted as the bot token. Report is still always written to file.
+  # Do not re-enable without a delivery test; see hardening spec WS3.
+  delivery_method: file  # file | email | telegram | slack
+  # telegram_bot_token: ${TELEGRAM_BOT_TOKEN}  # env var
+  # telegram_chat_id: ${TELEGRAM_CHAT_ID}      # env var
   # email_smtp_host: smtp.gmail.com
   # email_smtp_port: 587
   # email_from: autotrader@example.com

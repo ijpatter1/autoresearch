@@ -25,6 +25,7 @@ class PortfolioState:
     inception_date: str = ""
     cumulative_funding_cost: float = 0.0  # running total of funding costs
     daily_returns: list = field(default_factory=list)  # for rolling Sharpe
+    last_processed_timestamp: str = ""  # last hour booked; gates outage catch-up (WS1)
 
 
 def load_portfolio_state(path: str) -> PortfolioState:
@@ -49,6 +50,7 @@ def load_portfolio_state(path: str) -> PortfolioState:
         inception_date=data.get("inception_date", ""),
         cumulative_funding_cost=data.get("cumulative_funding_cost", 0.0),
         daily_returns=data.get("daily_returns", []),
+        last_processed_timestamp=data.get("last_processed_timestamp", ""),
     )
 
     # Validate critical values are finite
@@ -137,6 +139,7 @@ def update_portfolio(
         inception_date=inception,
         cumulative_funding_cost=state.cumulative_funding_cost + funding_cost,
         daily_returns=state.daily_returns,
+        last_processed_timestamp=state.last_processed_timestamp,
     )
 
     metrics = {

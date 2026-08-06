@@ -112,6 +112,18 @@ def generate_report(
     lines.append(f"  Fee comparison:     model={fee_comparison['model_fees']:.2f}% vs BIP={fee_comparison['bip_fees']:.2f}% (cumulative)")
     lines.append("")
 
+    # --- Data provenance (WS8) ---
+    parquet_path = config.get("data", {}).get("parquet_path")
+    provenance = _compute_venue_provenance(parquet_path)
+    if provenance:
+        lines.append("Data provenance (OHLCV venue):")
+        for row in provenance:
+            lines.append(
+                f"  {row['venue']:<12} {row['rows']:>7,} rows  "
+                f"{row['first']} to {row['last']}"
+            )
+        lines.append("")
+
     # --- Alerts ---
     if alerts:
         lines.append("Alerts:")
@@ -120,6 +132,32 @@ def generate_report(
         lines.append("")
 
     return "\n".join(lines)
+
+
+def _compute_venue_provenance(parquet_path: str | None) -> list[dict]:
+    """Per-venue row count and first/last timestamp from the OHLCV parquet.
+
+    Returns an empty list if the file is missing or carries no venue column
+    (i.e. the WS8 migration has not been run yet).
+    """
+    if not parquet_path or not os.path.exists(parquet_path):
+        return []
+    try:
+        df = pd.read_parquet(parquet_path, columns=["timestamp", "venue"])
+    except (ValueError, KeyError):
+        return []  # no venue column yet
+    if "venue" not in df.columns or len(df) == 0:
+        return []
+
+    out = []
+    for venue, grp in df.groupby("venue", sort=True):
+        out.append({
+            "venue": str(venue),
+            "rows": len(grp),
+            "first": str(grp["timestamp"].min()),
+            "last": str(grp["timestamp"].max()),
+        })
+    return out
 
 
 def _compute_today_return(log_path: str, date: str) -> float:
