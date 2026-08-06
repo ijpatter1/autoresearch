@@ -1,0 +1,13 @@
+[Unit]
+Description=BTC Paper Trader - hourly inference timer
+
+[Timer]
+# Five past every hour, matching the retired cron schedule.
+OnCalendar=*-*-* *:05:00
+# Replay runs missed while the host was off. This is the fix for the failure
+# actually observed: 65% uptime on a sleeping laptop, cron never firing.
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -29,20 +29,22 @@ from .data import (
     load_parquet,
     save_parquet,
     validate_candle,
+    venue_from_base_url,
 )
-from .inference import InferenceResult, compute_position, load_artifacts, run_inference, validate_artifacts
+from .inference import load_artifacts, validate_artifacts
+from .integrity import verify_artifact_integrity
 from .logging_config import (
     append_daily_summary,
     append_prediction_row,
     append_trade_row,
     setup_system_log,
 )
+from .pipeline import process_pending_hours
 from .portfolio import (
     PortfolioState,
     compute_daily_summary,
     load_portfolio_state,
     save_portfolio_state,
-    update_portfolio,
 )
 from .report import deliver_report, generate_report
 from .supplementary import append_supplementary_row, fetch_open_interest, fetch_orderbook_snapshot
@@ -114,6 +116,17 @@ def _run_hourly_inner(config: dict) -> int:
         logger.error(f"{elapsed()} Failed to load artifacts: {e}")
         return 2
 
+    # --- Environment integrity (WS4): reference predictions + library versions ---
+    integrity = verify_artifact_integrity(artifacts, config.get("integrity", {}))
+    for msg in integrity.messages:
+        if msg.startswith("OK"):
+            logger.info(f"{elapsed()} {msg}")
+        else:
+            logger.warning(f"{elapsed()} {msg}")
+    if integrity.fatal:
+        logger.error(f"{elapsed()} Integrity check fatal — refusing to trade")
+        return 2
+
     # --- Load historical data ---
     parquet_path = data_cfg["parquet_path"]
     try:
@@ -123,7 +136,9 @@ def _run_hourly_inner(config: dict) -> int:
         logger.error(f"{elapsed()} Failed to load parquet: {e}")
         return 2
 
-    # --- Backfill gap if data is stale ---
+    # --- Backfill gap if data is stale (candles + funding, venue-checked) ---
+    primary_venue = data_cfg.get("primary_venue", "binance_us")
+    allow_venue_mismatch = data_cfg.get("allow_venue_mismatch", False)
     latest_ts = df["timestamp"].max()
     import pandas as pd
     gap_hours = (pd.Timestamp.now("UTC").tz_localize(None) - latest_ts).total_seconds() / 3600
@@ -131,6 +146,7 @@ def _run_hourly_inner(config: dict) -> int:
         logger.info(f"{elapsed()} Data gap: {gap_hours:.0f}h since {latest_ts}. Backfilling...")
         df = backfill_recent_gap(
             df, symbol=data_cfg["symbol"], base_url=data_cfg["binance_base_url"],
+            primary_venue=primary_venue, allow_venue_mismatch=allow_venue_mismatch,
         )
         save_parquet(df, parquet_path)
         logger.info(f"{elapsed()} Backfill complete: {len(df)} rows")
@@ -161,131 +177,73 @@ def _run_hourly_inner(config: dict) -> int:
     funding_rate = funding_result[0] if funding_result else None
     logger.info(f"{elapsed()} Funding rate: {funding_rate:.6f}" if funding_rate else f"{elapsed()} Funding rate: forward-fill")
 
-    # --- Append to DataFrame and save ---
+    # --- Append current candle (venue-stamped) and save ---
     prev_len = len(df)
-    df = append_candle(df, candle, funding_rate)
+    df = append_candle(
+        df, candle, funding_rate,
+        venue=venue_from_base_url(data_cfg["binance_base_url"]),
+        primary_venue=primary_venue, allow_venue_mismatch=allow_venue_mismatch,
+    )
     save_parquet(df, parquet_path)
     new_rows = len(df) - prev_len
     logger.info(f"{elapsed()} Parquet saved: {len(df)} rows ({'+' + str(new_rows) if new_rows else 'dedup'})")
 
-    # --- Fetch supplementary data (non-critical) ---
+    # --- Fetch supplementary data (non-critical; current hour only) ---
     _fetch_supplementary(config, candle["close"])
 
-    # --- Run inference ---
-    logger.info(f"{elapsed()} Running inference on {len(df)} rows...")
-    try:
-        result = run_inference(df, artifacts)
-        logger.info(
-            f"{elapsed()} Inference done: pred_final={result.pred_final:.4f}, "
-            f"position={result.position:.2f}"
-        )
-    except Exception as e:
-        logger.error(f"{elapsed()} Inference failed: {e}", exc_info=True)
-        return 2
-
-    # --- Update portfolio ---
+    # --- Process the current hour, plus any hours missed during an outage ---
+    # Each pending hour is booked individually from the backfilled candles, so
+    # a resume after downtime produces the same ledger as uninterrupted running
+    # rather than one lumped multi-hour return (hardening spec WS1).
     state_path = os.path.join(os.path.dirname(parquet_path), "portfolio_state.json")
     state = load_portfolio_state(state_path)
 
-    new_position = compute_position(
-        result.pred_final,
-        sigma_threshold=trading_cfg["sigma_threshold"],
-        sigma_full=trading_cfg["sigma_full_position"],
-    )
+    resume_after, cap_msg = _resume_point(state, log_cfg["prediction_log"], df, trading_cfg)
+    if cap_msg:
+        logger.warning(f"{elapsed()} {cap_msg}")
 
-    # Get current funding rate from the DataFrame for cost calculation
-    current_funding_rate = 0.0
-    if "funding_rate" in df.columns:
-        current_funding_rate = float(df["funding_rate"].iloc[-1])
+    logger.info(f"{elapsed()} Running inference on {len(df)} rows...")
+    try:
+        pending = process_pending_hours(
+            df, artifacts, state, trading_cfg, config.get("bip_tracking", {}),
+            resume_after=resume_after,
+        )
+    except Exception as e:
+        logger.error(f"{elapsed()} Inference/processing failed: {e}", exc_info=True)
+        return 2
 
-    new_state, metrics = update_portfolio(
-        state,
-        new_position,
-        candle["close"],
-        fee_rate=trading_cfg["fee_rate"],
-        slippage_rate=trading_cfg["slippage_rate"],
-        funding_rate=current_funding_rate,
-    )
+    if pending.n_processed == 0:
+        logger.info(f"{elapsed()} No pending hours (already up to date); nothing booked")
+    else:
+        # Idempotent append: a timestamp already in the log is never rewritten,
+        # so a crash-and-retry replays to the same rows without duplication.
+        n_pred = _append_new_rows(log_cfg["prediction_log"], pending.pred_rows, append_prediction_row)
+        n_trade = _append_new_rows(log_cfg["trade_log"], pending.trade_rows, append_trade_row)
+        # Portfolio state is saved LAST: if anything above fails, the next run
+        # re-derives the same pending set from the unchanged state.
+        save_portfolio_state(pending.new_state, state_path)
+        last = pending.pred_rows[-1]
+        logger.info(
+            f"{elapsed()} Booked {pending.n_processed} hour(s) "
+            f"(+{n_pred} pred, +{n_trade} trade rows); "
+            f"portfolio={pending.new_state.portfolio_value:.4f}, "
+            f"pred_final={last['pred_final']:.4f}, position={last['position']:+.2f}"
+        )
 
-    # BIP fee tracking (parallel, doesn't affect P&L)
-    from .portfolio import compute_bip_fees
-    bip_cfg = config.get("bip_tracking", {})
-    bip = compute_bip_fees(
-        position_delta=metrics["position_delta"],
-        btc_price=candle["close"],
-        contract_size=bip_cfg.get("contract_size", 0.01),
-        fee_per_contract=bip_cfg.get("fee_per_contract", 0.46),
-        slippage_bps=bip_cfg.get("slippage_bps", 5.0),
-    )
-    save_portfolio_state(new_state, state_path)
-
-    logger.info(
-        f"Portfolio: value={metrics['portfolio_value']:.4f}, "
-        f"drawdown={metrics['drawdown']:.2%}"
-    )
-
-    # --- Log prediction row ---
-    pred_row = {
-        "timestamp": str(candle["timestamp"]),
-        "pred_24_raw": result.pred_24_raw,
-        "pred_72_raw": result.pred_72_raw,
-        "pred_72_smoothed": result.pred_72_smoothed,
-        "sign_agree": result.sign_agree,
-        "pred_after_72h": result.pred_after_72h,
-        "conf_prob": result.conf_prob,
-        "conf_smoothed": result.conf_smoothed,
-        "conf_norm": result.conf_norm,
-        "conf_adj": result.conf_adj,
-        "pred_after_conf": result.pred_after_conf,
-        "pos_scaler_signal": result.pos_scaler_signal,
-        "pos_scale": result.pos_scale,
-        "pred_after_pos": result.pred_after_pos,
-        "pred_after_scale": result.pred_after_scale,
-        "pred_final": result.pred_final,
-        "position": metrics["position"],
-        "position_prev": metrics["position_prev"],
-        "position_delta": metrics["position_delta"],
-        "fee_cost": metrics["fee_cost"],
-        "funding_rate": metrics["funding_rate"],
-        "funding_cost": metrics["funding_cost"],
-        "btc_price": candle["close"],
-        "btc_return_1h": metrics["btc_return_1h"],
-        "bip_n_contracts": bip["n_contracts"],
-        "bip_fee_cost": bip["total_bip_cost"],
-    }
-    append_prediction_row(log_cfg["prediction_log"], pred_row)
-
-    # --- Log trade (if position changed) ---
-    if metrics["position_changed"]:
-        direction = "flat"
-        if new_position > 1e-6:
-            direction = "long"
-        elif new_position < -1e-6:
-            direction = "short"
-
-        trade_row = {
-            "timestamp": str(candle["timestamp"]),
-            "direction": direction,
-            "size": abs(new_position),
-            "entry_price": candle["close"],
-            "pred_sigma": result.pred_final,
-            "conf_adj": result.conf_adj,
-            "pos_scale": result.pos_scale,
-        }
-        append_trade_row(log_cfg["trade_log"], trade_row)
-        logger.info(f"Trade logged: {direction} {abs(new_position):.2f}")
+    final_state = pending.new_state
 
     # --- Daily summary (first run of new day) ---
     today = str(candle["timestamp"].date()) if hasattr(candle["timestamp"], "date") else str(candle["timestamp"])[:10]
-    _maybe_log_daily_summary(log_cfg, today, new_state)
+    _maybe_log_daily_summary(log_cfg, today, final_state)
 
     # --- Health checks ---
+    last_pred_final = float(pending.pred_rows[-1]["pred_final"]) if pending.n_processed else 0.0
     alerts = run_health_checks(
         config=config,
         df=df,
-        pred_final=result.pred_final,
-        portfolio_value=new_state.portfolio_value,
-        peak_value=new_state.peak_value,
+        pred_final=last_pred_final,
+        portfolio_value=final_state.portfolio_value,
+        peak_value=final_state.peak_value,
         artifact_trained_at=artifacts["trained_at"],
     )
     if alerts:
@@ -295,6 +253,73 @@ def _run_hourly_inner(config: dict) -> int:
 
     logger.info(f"{elapsed()} === Hourly run complete ===")
     return 0
+
+
+def _resume_point(state, prediction_log_path, df, trading_cfg):
+    """Decide the exclusive lower bound for pending-hour processing.
+
+    Returns (resume_after, cap_message). resume_after is:
+      - state.last_processed_timestamp when present (steady state);
+      - else the last timestamp in the prediction log (first run after the
+        WS1 upgrade, before state carries the marker);
+      - else None (fresh deployment: process only the latest hour).
+
+    A catch-up longer than trading.max_catchup_hours is clamped to that window
+    and the truncation is returned as a message (never a silent cap). The
+    earlier gap is left unbooked for WS2's frozen-gap tagging to handle.
+    """
+    import pandas as pd
+
+    cutoff = df["timestamp"].max()
+    base = None
+    if state.last_processed_timestamp:
+        base = pd.Timestamp(state.last_processed_timestamp)
+    elif os.path.exists(prediction_log_path):
+        try:
+            ts = pd.read_csv(prediction_log_path, usecols=["timestamp"])["timestamp"]
+            if len(ts) > 0:
+                base = pd.Timestamp(ts.iloc[-1])
+        except Exception:
+            base = None
+
+    if base is None:
+        return None, None
+
+    max_catchup = int(trading_cfg.get("max_catchup_hours", 168))
+    pending_count = int(((df["timestamp"] > base) & (df["timestamp"] <= cutoff)).sum())
+    if pending_count > max_catchup:
+        clamped = cutoff - pd.Timedelta(hours=max_catchup)
+        msg = (
+            f"Catch-up of {pending_count}h exceeds max_catchup_hours={max_catchup}; "
+            f"booking only the most recent {max_catchup}h (after {clamped}). The "
+            f"earlier gap is left unbooked for gap-tagging (WS2)."
+        )
+        return clamped, msg
+    return base, None
+
+
+def _append_new_rows(path: str, rows: list, append_fn) -> int:
+    """Append rows whose timestamp is not already present. Returns count written."""
+    if not rows:
+        return 0
+    existing = _existing_timestamps(path)
+    written = 0
+    for row in rows:
+        if str(row["timestamp"]) not in existing:
+            append_fn(path, row)
+            written += 1
+    return written
+
+
+def _existing_timestamps(path: str) -> set:
+    """Timestamps already recorded in a CSV log (empty set if absent/unreadable)."""
+    if not os.path.exists(path):
+        return set()
+    try:
+        import pandas as pd
+        return set(pd.read_csv(path, usecols=["timestamp"])["timestamp"].astype(str))
+    except Exception:
+        return set()
 
 
 def _fetch_supplementary(config: dict, btc_price: float) -> None:

@@ -9,6 +9,7 @@ Usage:
 """
 
 import hashlib
+import platform
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from pathlib import Path
 import joblib
 import numpy as np
 import pandas as pd
+import scipy
 import sklearn
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
 
@@ -271,7 +273,16 @@ def export(train_end: str | None = None):
         "train_data_end": train_end,
         "commit": commit,
         "n_features": n_features,
+        # Full inference-environment fingerprint (hardening spec WS4). Startup
+        # compares these against the runtime; the frozen control predates all
+        # but sklearn_version and is pinned by content instead (data_hash +
+        # reference_predictions).
         "sklearn_version": sklearn.__version__,
+        "numpy_version": np.__version__,
+        "pandas_version": pd.__version__,
+        "scipy_version": scipy.__version__,
+        "joblib_version": joblib.__version__,
+        "python_version": platform.python_version(),
         "data_hash": data_hash,
         "reference_predictions": reference_predictions,
     }
@@ -279,11 +290,20 @@ def export(train_end: str | None = None):
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = ARTIFACTS_DIR / f"model_{commit}.joblib"
     joblib.dump(artifacts, out_path, compress=3)
+
+    # Parity sidecar: pins the artifact's traded output to a single hash (WS4).
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from src.integrity import write_parity_sidecar
+
+    sidecar = write_parity_sidecar(str(out_path), artifacts)
+
     print(f"\nArtifact saved: {out_path}")
     print(f"  Size: {out_path.stat().st_size / 1024 / 1024:.1f} MB")
     print(f"  Commit: {commit}")
-    print(f"  sklearn: {sklearn.__version__}")
+    print(f"  sklearn: {sklearn.__version__}, numpy: {np.__version__}, pandas: {pd.__version__}")
     print(f"  Features: {n_features}")
+    if sidecar:
+        print(f"  Parity sidecar: {sidecar}")
 
 
 if __name__ == "__main__":

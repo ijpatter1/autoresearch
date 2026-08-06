@@ -19,6 +19,77 @@ logger = logging.getLogger(__name__)
 # Convert to Binance-equivalent per-8h rate: rate / (365.25 * 3)
 _KRAKEN_ANNUAL_TO_8H = 1.0 / (365.25 * 3)
 
+# --- OHLCV venue provenance (hardening spec WS8) ---
+# The series silently changed venue at this boundary: Binance.com global
+# data (seeded from data.binance.vision) before it, Binance.US live API
+# data on and after it. Close is continuous across the seam but volume is
+# not (median hourly volume ~758 -> ~1.6). Every OHLCV row records its
+# venue so no future backfill can splice a foreign venue into what reads
+# as a continuous history.
+#
+# TODO(ian): decide whether to re-source 2026-03-01 onward from a
+# Binance.com-equivalent feed for continuity, or to treat 2026-03-01 as a
+# permanent venue boundary and never train across it (hardening spec D6).
+# Conservative default until then: mark the boundary, do not re-source, and
+# exclude cross-boundary rolling windows from any future training set.
+VENUE_BOUNDARY = pd.Timestamp("2026-03-01")
+VENUE_BEFORE = "binance_com"
+VENUE_AFTER = "binance_us"
+PRIMARY_VENUE_DEFAULT = "binance_us"
+
+
+def venue_for_timestamp(ts) -> str:
+    """Return the venue an OHLCV row belongs to, by the 2026-03-01 boundary."""
+    return VENUE_BEFORE if pd.Timestamp(ts) < VENUE_BOUNDARY else VENUE_AFTER
+
+
+def venue_from_base_url(base_url: str) -> str:
+    """Map a Binance REST base URL to its venue label."""
+    u = (base_url or "").lower()
+    if "binance.us" in u:
+        return "binance_us"
+    if "binance.com" in u or "binance.vision" in u:
+        return "binance_com"
+    return PRIMARY_VENUE_DEFAULT
+
+
+def add_venue_column(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of df with a 'venue' column assigned by the boundary rule.
+
+    Any venue values already present are preserved; only missing rows are
+    filled. Does not mutate the input.
+    """
+    df = df.copy()
+    computed = np.where(df["timestamp"] < VENUE_BOUNDARY, VENUE_BEFORE, VENUE_AFTER)
+    if "venue" in df.columns:
+        filled = pd.Series(computed, index=df.index)
+        df["venue"] = df["venue"].where(df["venue"].notna(), filled)
+    else:
+        df["venue"] = computed
+    return df
+
+
+def backfill_venue_check(
+    base_url: str,
+    primary_venue: str = PRIMARY_VENUE_DEFAULT,
+    allow_venue_mismatch: bool = False,
+) -> str:
+    """Verify a backfill source matches the file's declared primary venue.
+
+    Returns the resolved venue for base_url. Raises ValueError if it differs
+    from primary_venue and the override is not set — this is the guard that
+    stops a Binance.US refetch from writing thin volume into binance_com
+    history (or vice versa).
+    """
+    venue = venue_from_base_url(base_url)
+    if venue != primary_venue and not allow_venue_mismatch:
+        raise ValueError(
+            f"Backfill source {base_url!r} resolves to venue {venue!r}, which "
+            f"differs from the file's primary venue {primary_venue!r}. Refusing "
+            f"to splice venues. Set data.allow_venue_mismatch to override."
+        )
+    return venue
+
 
 def validate_candle(candle: dict) -> list[str]:
     """Validate candle data. Returns list of issues (empty if OK)."""
@@ -39,12 +110,21 @@ def backfill_recent_gap(
     df: pd.DataFrame,
     symbol: str = "BTCUSDT",
     base_url: str = "https://api.binance.us",
+    primary_venue: str = PRIMARY_VENUE_DEFAULT,
+    allow_venue_mismatch: bool = False,
 ) -> pd.DataFrame:
     """Fill gap between last parquet timestamp and now.
 
     Fetches missing candles from Binance US (up to 1000 per request).
     Returns updated DataFrame with gap filled.
+
+    Venue provenance (WS8): backfilled rows are stamped with the venue that
+    `base_url` resolves to, and the fetch is refused if that venue differs
+    from the file's `primary_venue` (unless `allow_venue_mismatch`).
     """
+    track_venue = "venue" in df.columns
+    fetch_venue = backfill_venue_check(base_url, primary_venue, allow_venue_mismatch)
+
     latest_ts = df["timestamp"].max()
     start_ms = int((latest_ts + pd.Timedelta(hours=1)).timestamp() * 1000)
     end_ms = int(pd.Timestamp.now("UTC").tz_localize(None).timestamp() * 1000)
@@ -87,6 +167,9 @@ def backfill_recent_gap(
         # Carry forward funding_rate if column exists
         if "funding_rate" in df.columns:
             new_df["funding_rate"] = df["funding_rate"].iloc[-1]
+        # Stamp venue provenance on backfilled rows
+        if track_venue:
+            new_df["venue"] = fetch_venue
         df = pd.concat([df, new_df], ignore_index=True)
         df = df.sort_values("timestamp").drop_duplicates(subset="timestamp").reset_index(drop=True)
         if "funding_rate" in df.columns:
@@ -248,10 +331,19 @@ def append_candle(
     df: pd.DataFrame,
     candle: dict,
     funding_rate: float | None = None,
+    *,
+    venue: str | None = None,
+    primary_venue: str = PRIMARY_VENUE_DEFAULT,
+    allow_venue_mismatch: bool = False,
 ) -> pd.DataFrame:
     """Append a candle to the DataFrame, with deduplication and funding forward-fill.
 
     Returns updated DataFrame (original is not modified).
+
+    Venue provenance (WS8): if the DataFrame carries a 'venue' column (or an
+    explicit venue is passed), the new row is stamped with `venue` (default:
+    `primary_venue`). A row whose venue differs from `primary_venue` is
+    refused unless `allow_venue_mismatch` is set.
     """
     ts = candle["timestamp"]
 
@@ -259,6 +351,14 @@ def append_candle(
     if ts in df["timestamp"].values:
         logger.info(f"Candle {ts} already exists, skipping")
         return df
+
+    track_venue = ("venue" in df.columns) or (venue is not None)
+    row_venue = venue if venue is not None else primary_venue
+    if track_venue and row_venue != primary_venue and not allow_venue_mismatch:
+        raise ValueError(
+            f"Refusing to append venue={row_venue!r} to a file whose primary "
+            f"venue is {primary_venue!r}. Set data.allow_venue_mismatch to override."
+        )
 
     new_row = {
         "timestamp": ts,
@@ -268,6 +368,8 @@ def append_candle(
         "close": candle["close"],
         "volume": candle["volume"],
     }
+    if track_venue:
+        new_row["venue"] = row_venue
 
     # Handle funding rate
     if "funding_rate" in df.columns:

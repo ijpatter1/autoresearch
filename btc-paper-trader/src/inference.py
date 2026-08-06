@@ -224,11 +224,15 @@ class FullInferenceResult:
     pred_final: np.ndarray       # (N,) after EMA-20
 
 
-def run_inference_full(df: pd.DataFrame, artifacts: dict) -> FullInferenceResult:
-    """Run inference on the full DataFrame, returning arrays for ALL hours.
+def predict_from_features(feats: np.ndarray, artifacts: dict) -> dict:
+    """The full post-processing chain, from a feature matrix to every stage.
 
-    Same pipeline as run_inference() but returns every intermediate array
-    instead of just the last row. Used by replay.py.
+    This is the single source of truth for the pipeline arithmetic. Both
+    run_inference_full() (which computes features from OHLCV first) and the
+    WS4 reference-prediction verifier call it, so the two can never drift.
+
+    Returns a dict keyed identically to the artifact's `reference_predictions`
+    block (minus `features`), so verification is a stage-by-stage comparison.
     """
     model = artifacts["model"]
     model_72 = artifacts["model_72"]
@@ -238,16 +242,6 @@ def run_inference_full(df: pd.DataFrame, artifacts: dict) -> FullInferenceResult
     conf_train_p5 = artifacts["conf_train_p5"]
     conf_train_p95 = artifacts["conf_train_p95"]
     scaler_feat_mask = artifacts["scaler_feat_mask"]
-
-    feats, ts, vol = compute_features(df)
-    feats = np.nan_to_num(feats, nan=0.0)
-
-    expected_n = artifacts["n_features"]
-    if feats.shape[1] != expected_n:
-        raise ValueError(
-            f"Feature count mismatch: computed {feats.shape[1]}, "
-            f"artifact expects {expected_n}"
-        )
 
     pred_24 = model.predict(feats)
     pred_72_raw = model_72.predict(feats)
@@ -262,29 +256,67 @@ def run_inference_full(df: pd.DataFrame, artifacts: dict) -> FullInferenceResult
     dampen = np.clip((conf_norm - 0.05) / 0.10, 0.0, 1.0)
     boost = np.clip((conf_norm - 0.85) / 0.10, 0.0, 1.0)
     conf_adj = 0.70 + 0.30 * dampen + 0.20 * boost
+    pred_after_conf = pred_after_72h * conf_adj
 
     scaler_signal = np.clip(pos_scaler.predict(feats[:, scaler_feat_mask]), 0.0, 1.0)
     pos_scale = 1.08 - 0.72 * scaler_signal
+    pred_after_pos = pred_after_conf * pos_scale
 
-    sigma_preds = pred_after_72h * conf_adj * pos_scale
-    pred_after_scale = sigma_preds * 0.35
+    pred_after_scale = pred_after_pos * 0.35
     pred_final = pd.Series(pred_after_scale).ewm(span=20, min_periods=1).mean().values
+
+    return {
+        "pred_24": pred_24,
+        "pred_72_raw": pred_72_raw,
+        "pred_72_smoothed": pred_72,
+        "sign_match": sign_match,
+        "pred_after_72h": pred_after_72h,
+        "conf_prob": conf_pred,
+        "conf_smoothed": conf_smooth,
+        "conf_norm": conf_norm,
+        "conf_adj": conf_adj,
+        "pred_after_conf": pred_after_conf,
+        "scaler_signal": scaler_signal,
+        "pos_scale": pos_scale,
+        "pred_after_pos": pred_after_pos,
+        "pred_after_scale": pred_after_scale,
+        "pred_final": pred_final,
+    }
+
+
+def run_inference_full(df: pd.DataFrame, artifacts: dict) -> FullInferenceResult:
+    """Run inference on the full DataFrame, returning arrays for ALL hours.
+
+    Same pipeline as run_inference() but returns every intermediate array
+    instead of just the last row. Used by replay.py and the gap catch-up path.
+    """
+    feats, ts, vol = compute_features(df)
+    feats = np.nan_to_num(feats, nan=0.0)
+
+    expected_n = artifacts["n_features"]
+    if feats.shape[1] != expected_n:
+        raise ValueError(
+            f"Feature count mismatch: computed {feats.shape[1]}, "
+            f"artifact expects {expected_n}"
+        )
+
+    p = predict_from_features(feats, artifacts)
 
     return FullInferenceResult(
         timestamps=ts,
-        pred_24_raw=pred_24,
-        pred_72_raw=pred_72_raw,
-        pred_72_smoothed=pred_72,
-        sign_agree=sign_match,
-        pred_after_72h=pred_after_72h,
-        conf_prob=conf_pred,
-        conf_smoothed=conf_smooth,
-        conf_norm=conf_norm,
-        conf_adj=conf_adj,
-        pos_scaler_signal=scaler_signal,
-        pos_scale=pos_scale,
-        pred_after_scale=pred_after_scale,
-        pred_final=pred_final,
+        pred_24_raw=p["pred_24"],
+        pred_72_raw=p["pred_72_raw"],
+        pred_72_smoothed=p["pred_72_smoothed"],
+        sign_agree=p["sign_match"],
+        pred_after_72h=p["pred_after_72h"],
+        conf_prob=p["conf_prob"],
+        conf_smoothed=p["conf_smoothed"],
+        conf_norm=p["conf_norm"],
+        conf_adj=p["conf_adj"],
+        pos_scaler_signal=p["scaler_signal"],
+        pos_scale=p["pos_scale"],
+        pred_after_scale=p["pred_after_scale"],
+        pred_final=p["pred_final"],
     )
 
 
