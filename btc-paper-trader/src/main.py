@@ -38,9 +38,12 @@ from .inference import load_artifacts, validate_artifacts
 from .integrity import verify_artifact_integrity
 from .logging_config import (
     DAILY_SUMMARY_FIELDS,
+    PREDICTION_FIELDS,
     SCHEMA_VERSION,
+    TRADE_FIELDS,
     append_prediction_row,
     append_trade_row,
+    ensure_v2_log,
     read_schema_version,
     setup_system_log,
 )
@@ -153,6 +156,14 @@ def _run_pipeline(config: dict, rs: _RunState) -> int:
         return f"[{time.time() - start_time:.1f}s]"
 
     logger.info(f"{elapsed()} === Hourly run starting ===")
+
+    # --- Upgrade pre-WS2 (v1) logs in place before anything reads or appends ---
+    # Without this, the first v2 run on a host with a v1 log appends 28-field
+    # rows to a 26-column file and every later read dies tokenizing it.
+    if ensure_v2_log(log_cfg["prediction_log"], PREDICTION_FIELDS, stamp_hour_status=True):
+        logger.info(f"{elapsed()} Prediction log upgraded to schema v{SCHEMA_VERSION}")
+    if ensure_v2_log(log_cfg["trade_log"], TRADE_FIELDS):
+        logger.info(f"{elapsed()} Trade log upgraded to schema v{SCHEMA_VERSION}")
 
     # --- Load model artifacts ---
     artifact_path = model_cfg["artifact_path"]
