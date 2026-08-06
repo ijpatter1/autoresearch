@@ -51,9 +51,13 @@ supplementary:
 
 reporting:
   daily_report_path: logs/daily_report.txt
-  delivery_method: telegram  # file | email | telegram | slack
-  telegram_bot_token: ${TELEGRAM_BOT_TOKEN}  # env var
-  telegram_chat_id: ${TELEGRAM_CHAT_ID}      # env var
+  # Disabled 2026-08-06: telegram delivery 404'd on all 83 attempts since
+  # inception — YAML does not expand ${VAR}, so the literal placeholder was
+  # posted as the bot token. Report is still always written to file.
+  # Do not re-enable without a delivery test; see hardening spec WS3.
+  delivery_method: file  # file | email | telegram | slack
+  # telegram_bot_token: ${TELEGRAM_BOT_TOKEN}  # env var
+  # telegram_chat_id: ${TELEGRAM_CHAT_ID}      # env var
   # email_smtp_host: smtp.gmail.com
   # email_smtp_port: 587
   # email_from: autotrader@example.com
