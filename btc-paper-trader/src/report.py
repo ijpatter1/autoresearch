@@ -1,20 +1,114 @@
 """Daily report generation and delivery.
 
-Generates a plain text report from prediction/portfolio logs and
-delivers it via file, Telegram, email, or Slack.
+Generates a plain text report from prediction/portfolio logs and delivers it
+via file (Telegram/email/Slack remain available but off by default).
+
+Every P&L, drawdown, Sharpe, monthly return, uptime, episode, and IC figure is
+computed by `src.ledger` (hardening spec WS5), so `verify_report.py` recomputes
+the same numbers from the raw CSV and fails if the report and the ledger ever
+disagree. The three pre-hardening report bugs — max drawdown mirroring current
+drawdown, monthly returns compounded from the unusable daily file, and activity
+reported only as position adjustments — are fixed here.
 """
 
 import logging
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import requests
 
-from .portfolio import PortfolioState, compute_rolling_sharpe
+from . import ledger
+from .portfolio import PortfolioState
 
 logger = logging.getLogger(__name__)
+
+
+def _ohlcv_close(config: dict):
+    """Complete OHLCV close series indexed by timestamp, or None if absent."""
+    path = config.get("data", {}).get("parquet_path")
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_parquet(path, columns=["timestamp", "close"])
+    except (ValueError, KeyError, OSError):
+        return None
+    return df.set_index("timestamp")["close"]
+
+
+def _artifact_age_days(artifact_metadata: dict, today: str) -> int | None:
+    """Whole days between the artifact's training date and `today`, or None."""
+    trained = artifact_metadata.get("trained_at")
+    if not trained:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(str(trained)[:19], fmt)
+            return (datetime.strptime(today, "%Y-%m-%d") - dt).days
+        except ValueError:
+            continue
+    return None
+
+
+def report_numbers(
+    config: dict,
+    prediction_log_path: str,
+    portfolio_state: PortfolioState,
+    artifact_metadata: dict,
+    today: str | None = None,
+) -> dict:
+    """Every reported figure, computed from the ledger — the values the report
+    prints and `verify_report.py` recomputes. Independent of wall-clock time
+    except `today` (defaults to the last ledger day for reproducibility)."""
+    df = ledger.load_ledger(prediction_log_path)
+    if today is None:
+        today = (str(df["timestamp"].max().date()) if len(df)
+                 else datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+
+    pnl = ledger.split_pnl(df)
+    dd = ledger.drawdowns(df)
+    shp = ledger.sharpes(df)
+    up = ledger.uptime(df)
+    # 24h IC needs the complete OHLCV series for the forward price (the log's
+    # gaps would bias it); skip the IC if the parquet is unavailable.
+    ic = ledger.ic_24h(df, price_series=_ohlcv_close(config))
+    eps = ledger.episodes(df)
+
+    pv = portfolio_state.portfolio_value
+    peak = portfolio_state.peak_value
+    current_dd = (pv - peak) / peak if peak > 0 else 0.0
+
+    return {
+        "today": today,
+        "portfolio_value": pv,
+        "cum_return_pct": (pv - 1.0) * 100,
+        "peak_value": peak,
+        "current_drawdown_pct": current_dd * 100,
+        "max_drawdown_combined_pct": dd["combined"] * 100,
+        "max_drawdown_decided_pct": dd["decided"] * 100,
+        "decided_net_pct": pnl["decided_net"] * 100,
+        "frozen_gross_pct": pnl["frozen_gross"] * 100,
+        "combined_net_pct": pnl["combined_net"] * 100,
+        "sharpe_combined": shp["combined"],
+        "sharpe_decided": shp["decided"],
+        "monthly": ledger.monthly_returns(df),
+        "uptime_24h_pct": up["h24"] * 100,
+        "uptime_7d_pct": up["d7"] * 100,
+        "uptime_inception_pct": up["inception"] * 100,
+        "n_gaps": up["n_gaps"],
+        "n_episodes": len(eps),
+        "n_episodes_profitable": sum(e["profitable"] for e in eps),
+        "episode_win_rate_pct": ledger.episode_win_rate(df),
+        "positioned_hour_win_rate_pct": ledger.positioned_hour_win_rate(df),
+        "position_adjustments": int((df["position_delta"].abs() > 1e-6).sum())
+        if "position_delta" in df.columns and len(df) else 0,
+        "ic_24h": ic["ic"],
+        "ic_24h_lo": ic["lo"],
+        "ic_24h_hi": ic["hi"],
+        "ic_24h_n": ic["n"],
+        "artifact_age_days": _artifact_age_days(artifact_metadata, today),
+    }
 
 
 def generate_report(
@@ -36,53 +130,68 @@ def generate_report(
     Returns:
         Report as a plain text string.
     """
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    m = report_numbers(config, prediction_log_path, portfolio_state, artifact_metadata)
+    today = m["today"]
     commit = artifact_metadata.get("commit", "unknown")
     inception = portfolio_state.inception_date or today
 
-    # Calculate day count
     try:
         inception_dt = datetime.strptime(inception, "%Y-%m-%d")
         day_count = (datetime.strptime(today, "%Y-%m-%d") - inception_dt).days + 1
     except ValueError:
         day_count = 0
 
+    age = m["artifact_age_days"]
+    age_str = f"{age}d old" if age is not None else "age unknown"
+
     lines = []
 
     # --- Header ---
     lines.append(f"BTC Paper Trader — Daily Report — {today}")
-    lines.append(f"Model: {commit} | Running since: {inception} | Day {day_count}")
+    lines.append(f"Model: {commit} ({age_str}) | Running since: {inception} | Day {day_count}")
     lines.append("")
 
     # --- Portfolio summary ---
-    pv = portfolio_state.portfolio_value
-    cum_return = (pv - 1.0) * 100
-    peak = portfolio_state.peak_value
-    drawdown = (pv - peak) / peak * 100 if peak > 0 else 0.0
-
-    # Compute today's return from prediction log
     today_return = _compute_today_return(prediction_log_path, today)
-
     lines.append("Portfolio summary:")
-    lines.append(f"  Portfolio value:    {pv:.4f} ({cum_return:+.2f}% since inception)")
+    lines.append(f"  Portfolio value:    {m['portfolio_value']:.4f} ({m['cum_return_pct']:+.2f}% since inception)")
     lines.append(f"  Today's return:     {today_return:+.2f}%")
-    lines.append(f"  Peak value:         {peak:.4f}")
-    lines.append(f"  Current drawdown:   {drawdown:.2f}%")
-    lines.append(f"  Max drawdown:       {drawdown:.2f}%")
+    lines.append(f"  Peak value:         {m['peak_value']:.4f}")
+    lines.append(f"  Current drawdown:   {m['current_drawdown_pct']:.2f}%")
+    # Max drawdown is the running peak-to-trough of the equity curve — a
+    # separate figure from current drawdown (the pre-hardening bug printed the
+    # same value on both lines).
+    lines.append(f"  Max drawdown:       {m['max_drawdown_combined_pct']:.2f}% combined / "
+                 f"{m['max_drawdown_decided_pct']:.2f}% decided-only")
 
-    # Funding costs
     today_funding = _compute_today_funding(prediction_log_path, today)
     cum_funding = portfolio_state.cumulative_funding_cost * 100
     lines.append(f"  Funding costs:      {today_funding:+.3f}% (today) / {cum_funding:+.3f}% (cumulative)")
     lines.append("")
 
-    # --- Trading activity ---
+    # --- Decided / frozen split (WS2) ---
+    lines.append("Decided vs frozen (P&L attribution):")
+    lines.append(f"  Combined net:       {m['combined_net_pct']:+.3f}%")
+    lines.append(f"  Decided net:        {m['decided_net_pct']:+.3f}%  (frozen hours zeroed)")
+    lines.append(f"  Frozen gross:       {m['frozen_gross_pct']:+.3f}%")
+    lines.append("")
+
+    # --- Uptime (WS3/WS5) ---
+    lines.append("Uptime (logged / expected hours):")
+    lines.append(f"  Last 24h:           {m['uptime_24h_pct']:.1f}%")
+    lines.append(f"  Last 7d:            {m['uptime_7d_pct']:.1f}%")
+    lines.append(f"  Since inception:    {m['uptime_inception_pct']:.1f}%  ({m['n_gaps']} gaps)")
+    lines.append("")
+
+    # --- Trading activity: adjustments AND episodes, labeled win rates ---
     activity = _compute_trading_activity(prediction_log_path, today, portfolio_state)
-    lines.append("Trading activity (last 24h):")
-    lines.append(f"  Position changes:   {activity['n_trades']}")
+    lines.append("Trading activity:")
+    lines.append(f"  Position adjustments (total): {m['position_adjustments']}")
+    lines.append(f"  Episodes:           {m['n_episodes']} ({m['n_episodes_profitable']} profitable)")
+    lines.append(f"  Win rate (per episode):        {m['episode_win_rate_pct']:.0f}%")
+    lines.append(f"  Win rate (per positioned hour): {m['positioned_hour_win_rate_pct']:.0f}%")
     lines.append(f"  Current position:   {activity['current_pos_str']}")
-    lines.append(f"  Hours positioned:   {activity['hours_positioned']}/24")
-    lines.append(f"  Avg |position|:     {activity['avg_position']:.2f}")
+    lines.append(f"  Last 24h positioned: {activity['hours_positioned']}/24")
     lines.append("")
 
     # --- Prediction diagnostics ---
@@ -95,19 +204,15 @@ def generate_report(
     lines.append("")
 
     # --- Running metrics ---
-    sharpe_30d = compute_rolling_sharpe(prediction_log_path, days=30)
-    sharpe_all = compute_rolling_sharpe(prediction_log_path, days=9999)
-    metrics = _compute_running_metrics(prediction_log_path, portfolio_state)
-
     lines.append("Running metrics:")
     lines.append(f"  Trades (total):     {portfolio_state.trade_count}")
-    lines.append(f"  Sharpe (30-day):    {sharpe_30d:.2f}")
-    lines.append(f"  Sharpe (inception): {sharpe_all:.2f}")
-    lines.append(f"  Win rate:           {metrics['win_rate']:.0f}%")
-    lines.append(f"  Avg trade duration: {metrics['avg_trade_duration']:.1f} hours")
-    lines.append(f"  Monthly returns:    {metrics['monthly_returns_str']}")
+    lines.append(f"  Sharpe (combined):  {m['sharpe_combined']:.2f}")
+    lines.append(f"  Sharpe (decided):   {m['sharpe_decided']:.2f}")
+    lines.append(f"  24h IC to date:     {m['ic_24h']:+.3f}  [{m['ic_24h_lo']:+.3f}, {m['ic_24h_hi']:+.3f}] "
+                 f"(n={m['ic_24h_n']}, rough CI)")
+    monthly_str = ", ".join(f"{mon} {ret * 100:+.1f}%" for mon, ret in sorted(m["monthly"].items()))
+    lines.append(f"  Monthly returns:    {monthly_str or 'N/A'}")
 
-    # Fee comparison
     fee_comparison = _compute_fee_comparison(prediction_log_path)
     lines.append(f"  Fee comparison:     model={fee_comparison['model_fees']:.2f}% vs BIP={fee_comparison['bip_fees']:.2f}% (cumulative)")
     lines.append("")
@@ -291,57 +396,6 @@ def _compute_pred_diagnostics(log_path: str, date: str) -> dict:
         "disagreements": disagree,
         "conf_min": float(np.min(conf_adj)),
         "conf_max": float(np.max(conf_adj)),
-    }
-
-
-def _compute_running_metrics(log_path: str, state: PortfolioState) -> dict:
-    """Compute running metrics from the full prediction log."""
-    default = {
-        "win_rate": 0.0,
-        "avg_trade_duration": 0.0,
-        "monthly_returns_str": "N/A",
-    }
-    if not os.path.exists(log_path):
-        return default
-
-    df = pd.read_csv(log_path)
-    if len(df) == 0:
-        return default
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-
-    # Win rate: fraction of hours with positive P&L when positioned
-    positioned = df[df["position_prev"].abs() > 1e-6]
-    if len(positioned) > 0:
-        hourly_pnl = positioned["position_prev"] * positioned["btc_return_1h"] - positioned["fee_cost"]
-        win_rate = float((hourly_pnl > 0).mean() * 100)
-    else:
-        win_rate = 0.0
-
-    # Average trade duration
-    pos_changes = df[df["position_delta"].abs() > 1e-6]
-    if len(pos_changes) > 1:
-        durations = pos_changes["timestamp"].diff().dt.total_seconds() / 3600
-        avg_duration = float(durations.dropna().mean())
-    else:
-        avg_duration = 0.0
-
-    # Monthly returns string (last 3 months)
-    df["month"] = df["timestamp"].dt.to_period("M")
-    monthly_returns = []
-    for month in df["month"].unique()[-3:]:
-        month_data = df[df["month"] == month]
-        hourly_rets = month_data["position_prev"] * month_data["btc_return_1h"] - month_data["fee_cost"]
-        month_ret = (1 + hourly_rets).prod() - 1
-        month_str = str(month)
-        monthly_returns.append(f"{month_str} {month_ret:+.1%}")
-
-    monthly_str = ", ".join(monthly_returns) if monthly_returns else "N/A"
-
-    return {
-        "win_rate": win_rate,
-        "avg_trade_duration": avg_duration,
-        "monthly_returns_str": monthly_str,
     }
 
 

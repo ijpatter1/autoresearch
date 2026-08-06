@@ -39,6 +39,11 @@ trading:
   # longer than this is clamped to the most recent window and the truncation is
   # logged; the earlier gap is left for WS2 frozen-gap tagging.
   max_catchup_hours: 168
+  # Resume policy (WS2, decision D1). Default false: hold the inherited position
+  # through an outage and tag its P&L frozen — the honest record, since the model
+  # never ran those hours. true flattens to no exposure for the gap, which
+  # changes the strategy; kept off by default.
+  flatten_on_resume: false
 
 logging:
   prediction_log: logs/predictions.csv

@@ -1,27 +1,32 @@
-"""Per-hour processing and outage catch-up (hardening spec WS1).
+"""Per-hour processing, outage catch-up, and the decided/frozen split
+(hardening spec WS1 + WS2).
 
 The pre-hardening pipeline booked one lumped multi-hour return when it
 resumed after an outage: it advanced the portfolio from the last processed
 price straight to the current price in a single step. Half the audited gross
 P&L rode on 16 such lumped resumes.
 
-This module processes every pending hour *individually*. On resume it walks
-each missed hour in order, booking a one-hour return per hour from the
-backfilled candles — so a catch-up over N hours produces a ledger identical
-to N uninterrupted hourly runs. It is pure and network-free: the caller
-fetches/backfills candles and does the I/O; this decides.
+This module processes every pending hour *individually* and tags each with
+its decision status:
 
-Idempotency: pending hours are gated by `resume_after` (the last processed
-timestamp, carried in portfolio state). Re-running an already-processed hour
-finds nothing pending and is a no-op. The catch-up is deterministic, so a
-crash mid-write replays to the same rows, which the caller dedupes by
-timestamp.
+  - The last pending hour is the current live run: the model decides the
+    position and the row is tagged *decided*.
+  - Every earlier pending hour was missed while the pipeline was down. Under
+    the resume policy (D1) the inherited position is *held*, not re-decided,
+    and the row is tagged *frozen* — P&L accrued on a position no live run
+    ever chose. This is the accounting-truth layer WS1 deferred: it makes the
+    ledger honest about which hours the model actually acted on, rather than
+    fabricating decisions for hours it never ran.
 
-NOTE (WS1/WS2 boundary): pending hours here are *re-decided* from the
-backfilled candles — that is the mechanism, and it reproduces an
-uninterrupted run exactly. Tagging those hours as frozen (position held, not
-re-decided) and the resume policy (D1) belong to WS2/PR2; they layer on top
-of this without changing the per-hour walk.
+The alternative (`flatten_on_resume=True`) treats the outage as out-of-market:
+frozen hours carry no exposure. It changes the strategy and is off by default.
+
+It is pure and network-free: the caller fetches/backfills candles and does the
+I/O; this decides. Idempotency: pending hours are gated by `resume_after` (the
+last processed timestamp, carried in portfolio state). Re-running an
+already-processed hour finds nothing pending and is a no-op. The walk is
+deterministic, so a crash mid-write replays to the same rows, which the caller
+dedupes by timestamp.
 """
 
 import logging
@@ -30,6 +35,7 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from .inference import FullInferenceResult, compute_position, run_inference_full
+from .ledger import DECIDED, FROZEN
 from .portfolio import PortfolioState, compute_bip_fees, update_portfolio
 
 logger = logging.getLogger(__name__)
@@ -44,13 +50,17 @@ class PendingResult:
     trade_rows: list = field(default_factory=list)
     n_processed: int = 0
     n_trades: int = 0
+    n_frozen: int = 0
+    n_decided: int = 0
 
 
 def _pred_row(ts, r: FullInferenceResult, idx: int, price: float,
-              funding_rate: float, metrics: dict, bip: dict) -> dict:
+              funding_rate: float, metrics: dict, bip: dict,
+              hour_status: str = DECIDED) -> dict:
     """Build one prediction-log row (schema: logging_config.PREDICTION_FIELDS)."""
     return {
         "timestamp": str(ts),
+        "hour_status": hour_status,
         "pred_24_raw": r.pred_24_raw[idx],
         "pred_72_raw": r.pred_72_raw[idx],
         "pred_72_smoothed": r.pred_72_smoothed[idx],
@@ -106,8 +116,14 @@ def process_pending_hours(
     *,
     resume_after=None,
     full_result: FullInferenceResult | None = None,
+    flatten_on_resume: bool = False,
 ) -> PendingResult:
     """Process every completed hour after `resume_after` up to the last candle.
+
+    The last pending hour is the current live run (decided); every earlier
+    pending hour was missed during an outage and is booked frozen, holding the
+    inherited position (D1). With `flatten_on_resume`, frozen hours instead
+    carry no exposure (the outage is modelled as out-of-market).
 
     Args:
         df: OHLCV history ending at the latest completed hour. The caller is
@@ -117,10 +133,14 @@ def process_pending_hours(
         resume_after: last already-processed hour (exclusive lower bound).
             None means process only the final row (fresh start, no catch-up).
         full_result: precomputed run_inference_full(df); computed if omitted.
+        flatten_on_resume: hold the inherited position through the gap (default)
+            or flatten to no exposure for the frozen hours.
 
     Returns a PendingResult with the advanced state and the rows to log. Does
     no I/O and does not mutate `state`.
     """
+    import dataclasses
+
     bip_cfg = bip_cfg or {}
     if full_result is None:
         full_result = run_inference_full(df, artifacts)
@@ -147,8 +167,15 @@ def process_pending_hours(
 
     result = PendingResult(new_state=state)
     cur = state
+    n_pending = len(pending_positions)
 
-    for idx in pending_positions:
+    # Flatten-on-resume models the outage as out-of-market: drop the inherited
+    # position to flat before booking the missed hours, so no frozen P&L
+    # accrues. No fee is booked — the pipeline was down, not trading.
+    if flatten_on_resume and n_pending > 1:
+        cur = dataclasses.replace(cur, position=0.0)
+
+    for rank, idx in enumerate(pending_positions):
         ts = ts_index[idx]
         # Price/funding come from the candle record, keyed by timestamp.
         try:
@@ -161,12 +188,21 @@ def process_pending_hours(
             fr = funding_by_ts.loc[ts]
             funding_rate = float(fr) if pd.notna(fr) else 0.0
 
-        pred_final = float(full_result.pred_final[idx])
-        position = compute_position(
-            pred_final,
-            sigma_threshold=trading_cfg["sigma_threshold"],
-            sigma_full=trading_cfg["sigma_full_position"],
-        )
+        # The last pending hour is the live decision; earlier ones were missed.
+        is_live = rank == n_pending - 1
+        if is_live:
+            status = DECIDED
+            pred_final = float(full_result.pred_final[idx])
+            position = compute_position(
+                pred_final,
+                sigma_threshold=trading_cfg["sigma_threshold"],
+                sigma_full=trading_cfg["sigma_full_position"],
+            )
+        else:
+            # Frozen hour: hold the inherited position, no live re-decision
+            # (or flat, if flattened above). The model never ran this hour.
+            status = FROZEN
+            position = cur.position
 
         new_state, metrics = update_portfolio(
             cur, position, price,
@@ -185,11 +221,15 @@ def process_pending_hours(
         # Advance the resume marker with each processed hour.
         new_state.last_processed_timestamp = str(ts)
 
-        result.pred_rows.append(_pred_row(ts, full_result, idx, price, funding_rate, metrics, bip))
+        result.pred_rows.append(
+            _pred_row(ts, full_result, idx, price, funding_rate, metrics, bip,
+                      hour_status=status))
         if metrics["position_changed"]:
             result.trade_rows.append(_trade_row(ts, position, price, full_result, idx))
             result.n_trades += 1
         result.n_processed += 1
+        result.n_frozen += status == FROZEN
+        result.n_decided += status == DECIDED
         cur = new_state
 
     result.new_state = cur
