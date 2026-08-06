@@ -9,8 +9,14 @@ import pytest
 
 import src.main as main_mod
 from src.data import load_parquet
-from src.logging_config import append_prediction_row
-from src.main import _append_new_rows, _existing_timestamps, _resume_point, run_hourly
+from src.logging_config import append_prediction_row, read_schema_version
+from src.main import (
+    _append_new_rows,
+    _existing_timestamps,
+    _maybe_log_daily_summary,
+    _resume_point,
+    run_hourly,
+)
 from src.portfolio import PortfolioState, load_portfolio_state
 
 
@@ -78,6 +84,56 @@ class TestIdempotentAppend:
     def test_empty_rows_noop(self, tmp_path):
         log = tmp_path / "predictions.csv"
         assert _append_new_rows(str(log), [], append_prediction_row) == 0
+
+
+class TestDailySummaryRegeneration:
+    """WS5: the daily summary is a regenerated view of the hourly ledger."""
+
+    def _pred_log(self, path):
+        # Two full days of contiguous hourly rows, then a third partial day.
+        ts = pd.date_range("2026-05-01 00:00", periods=54, freq="h")
+        for i, t in enumerate(ts):
+            append_prediction_row(str(path), {
+                "timestamp": str(t), "pred_final": 0.5, "pred_24_raw": 0.3,
+                "position": 1.0, "position_prev": 1.0, "position_delta": 0.0,
+                "fee_cost": 0.0, "funding_rate": 0.0, "funding_cost": 0.0,
+                "btc_price": 100.0 + i, "btc_return_1h": 0.001,
+                "bip_n_contracts": 0, "bip_fee_cost": 0.0, "hour_status": "decided",
+            })
+
+    def test_regenerates_completed_days_only(self, tmp_path):
+        pred = tmp_path / "predictions.csv"
+        summary = tmp_path / "daily_summary.csv"
+        self._pred_log(pred)
+        log_cfg = {"prediction_log": str(pred), "daily_summary_log": str(summary)}
+        _maybe_log_daily_summary(log_cfg, "2026-05-03", PortfolioState())
+        out = pd.read_csv(summary)
+        # Only the two completed days (05-01, 05-02), not the partial 05-03.
+        assert list(out["date"]) == ["2026-05-01", "2026-05-02"]
+        assert (out["schema_version"] == 2).all()
+
+    def test_idempotent_regeneration(self, tmp_path):
+        pred = tmp_path / "predictions.csv"
+        summary = tmp_path / "daily_summary.csv"
+        self._pred_log(pred)
+        log_cfg = {"prediction_log": str(pred), "daily_summary_log": str(summary)}
+        _maybe_log_daily_summary(log_cfg, "2026-05-03", PortfolioState())
+        first = summary.read_bytes()
+        _maybe_log_daily_summary(log_cfg, "2026-05-03", PortfolioState())
+        assert summary.read_bytes() == first  # no duplicate rows
+
+    def test_preserves_pre_ws2_file_once(self, tmp_path):
+        pred = tmp_path / "predictions.csv"
+        summary = tmp_path / "daily_summary.csv"
+        self._pred_log(pred)
+        # A pre-hardening (v1) summary already on disk.
+        summary.write_text("date,portfolio_value,daily_return\n2026-05-01,1.0,0.0\n")
+        assert read_schema_version(str(summary)) == 1
+        log_cfg = {"prediction_log": str(pred), "daily_summary_log": str(summary)}
+        _maybe_log_daily_summary(log_cfg, "2026-05-03", PortfolioState())
+        backup = tmp_path / "daily_summary.csv.pre-ws2.bak"
+        assert backup.exists()  # original preserved
+        assert read_schema_version(str(summary)) == 2  # new file is v2
 
 
 class TestHourlyRunEndToEnd:

@@ -227,6 +227,8 @@ def replay(
             "btc_return_1h": btc_return,
             "bip_n_contracts": bip["n_contracts"],
             "bip_fee_cost": bip["total_bip_cost"],
+            # Replay is continuous (no outages), so every hour is decided.
+            "hour_status": "decided",
         }
         append_prediction_row(pred_log, pred_row)
 
@@ -280,28 +282,44 @@ def replay(
     seg_parity = _compute_segment_metrics(pred_log, start_ts, parity_cutoff - pd.Timedelta(hours=1))
     seg_oos = _compute_segment_metrics(pred_log, parity_cutoff, end_ts)
 
-    # Parity assessment
+    # Parity assessment. Compare like with like: the backtester's 17 is a count
+    # of direction changes, not position adjustments. The pre-fix code compared
+    # n_trades (278 adjustments) to 17 and printed MISMATCH on a run that
+    # actually matched.
     parity_return_ok = abs(seg_parity["total_return"] - 4.3) < 0.5 if seg_parity["n_hours"] > 0 else False
-    parity_trades_ok = abs(seg_parity["n_trades"] - 17) <= 5 if seg_parity["n_hours"] > 0 else False
+    parity_trades_ok = abs(seg_parity["direction_changes"] - 17) <= 5 if seg_parity["n_hours"] > 0 else False
     parity_assessment = "MATCH" if (parity_return_ok and parity_trades_ok) else "MISMATCH"
 
-    # Generate segmented report
+    # Segment labels. Jan–Feb 2026 is FORWARD data the model never saw
+    # (train_data_end 2025-12-31), so it is the strongest out-of-sample evidence
+    # in the record, and it is also where the backtester parity check lives. The
+    # pre-fix labels called it the "infrastructure parity check" and named March
+    # the "genuine out-of-sample validation" — but March has ~2 positioned hours
+    # in 721 and carries no information. The labels inverted their value.
     report = f"""Replay Summary
 ==============
 
-=== INFRASTRUCTURE PARITY CHECK (Jan 1 - Feb 28) ===
+=== OUT-OF-SAMPLE (Jan 1 - Feb 28) — forward data, also backtester parity ===
+
+  The strongest evidence in the record: the model trained through 2025-12-31,
+  so these are hours it never saw. Doubles as the backtester parity check.
 
   Hours replayed:       {seg_parity['n_hours']:,}
-  Trades:               {seg_parity['n_trades']} (backtester: 17)
+  Direction changes:    {seg_parity['direction_changes']} (backtester: 17)
+  Position adjustments: {seg_parity['n_trades']}
   Return:               {seg_parity['total_return']:+.1f}% (backtester: +4.3%)
   Sharpe:               {seg_parity['sharpe']:.2f} (backtester: 3.86)
   Max drawdown:         {seg_parity['max_drawdown']:.2f}%
   Parity assessment:    {parity_assessment}
 
-=== GENUINE OUT-OF-SAMPLE VALIDATION (Mar 1 - present) ===
+=== LOW-INFORMATION (Mar 1 - present) — near-flat, few positioned hours ===
+
+  Nearly flat over the window (a handful of positioned hours); carries little
+  information despite being the most recent segment.
 
   Hours replayed:       {seg_oos['n_hours']:,}
-  Trades:               {seg_oos['n_trades']}
+  Direction changes:    {seg_oos['direction_changes']}
+  Position adjustments: {seg_oos['n_trades']}
   Return:               {seg_oos['total_return']:+.2f}%
   Sharpe:               {seg_oos['sharpe']:.2f}
   Max drawdown:         {seg_oos['max_drawdown']:.2f}%
@@ -383,7 +401,8 @@ def _log_replay_daily_summary(summary_log, pred_log, date, state):
 def _compute_segment_metrics(pred_log: str, seg_start, seg_end) -> dict:
     """Compute metrics for a time segment of the prediction log."""
     default = {
-        "n_hours": 0, "n_trades": 0, "total_return": 0.0, "sharpe": 0.0,
+        "n_hours": 0, "n_trades": 0, "direction_changes": 0,
+        "total_return": 0.0, "sharpe": 0.0,
         "max_drawdown": 0.0, "win_rate": 0.0, "avg_position": 0.0,
         "long_trades": 0, "short_trades": 0,
         "total_funding_cost": 0.0, "total_fee_cost": 0.0,
@@ -419,11 +438,17 @@ def _compute_segment_metrics(pred_log: str, seg_start, seg_end) -> dict:
     dd = (equity - peak) / peak
     max_drawdown = float(dd.min() * 100)
 
-    # Trade counts
+    # Trade counts. n_trades counts every position adjustment (resize);
+    # direction_changes counts only transitions between flat/long/short — the
+    # backtester's notion of a trade. The parity check must compare against the
+    # latter (see the MISMATCH-on-a-match bug fixed below).
     trades = seg[seg["position_delta"].abs() > 1e-6]
     n_trades = len(trades)
     long_trades = int((trades["position"] > 1e-6).sum()) if n_trades > 0 else 0
     short_trades = int((trades["position"] < -1e-6).sum()) if n_trades > 0 else 0
+    pos = seg["position"].to_numpy()
+    direction = np.where(pos > 1e-6, 1, np.where(pos < -1e-6, -1, 0))
+    direction_changes = int((np.diff(direction) != 0).sum()) if len(direction) > 1 else 0
 
     # Win rate (hours with positive P&L when positioned)
     positioned = seg[seg["position_prev"].abs() > 1e-6]
@@ -438,6 +463,7 @@ def _compute_segment_metrics(pred_log: str, seg_start, seg_end) -> dict:
     return {
         "n_hours": len(seg),
         "n_trades": n_trades,
+        "direction_changes": direction_changes,
         "total_return": total_return,
         "sharpe": sharpe,
         "max_drawdown": max_drawdown,

@@ -34,15 +34,17 @@ from .data import (
 from .inference import load_artifacts, validate_artifacts
 from .integrity import verify_artifact_integrity
 from .logging_config import (
-    append_daily_summary,
+    DAILY_SUMMARY_FIELDS,
+    SCHEMA_VERSION,
     append_prediction_row,
     append_trade_row,
+    read_schema_version,
     setup_system_log,
 )
 from .pipeline import process_pending_hours
+from .ledger import daily_rows, load_ledger
 from .portfolio import (
     PortfolioState,
-    compute_daily_summary,
     load_portfolio_state,
     save_portfolio_state,
 )
@@ -207,6 +209,7 @@ def _run_hourly_inner(config: dict) -> int:
         pending = process_pending_hours(
             df, artifacts, state, trading_cfg, config.get("bip_tracking", {}),
             resume_after=resume_after,
+            flatten_on_resume=trading_cfg.get("flatten_on_resume", False),
         )
     except Exception as e:
         logger.error(f"{elapsed()} Inference/processing failed: {e}", exc_info=True)
@@ -354,23 +357,38 @@ def _fetch_supplementary(config: dict, btc_price: float) -> None:
 
 
 def _maybe_log_daily_summary(log_cfg: dict, today: str, state: PortfolioState) -> None:
-    """Log daily summary if it hasn't been logged for today yet."""
+    """Regenerate the daily summary from the hourly ledger (WS5).
+
+    The daily summary is a *view* of predictions.csv — regenerated from the
+    ledger, never the reverse — so it is rewritten from `ledger.daily_rows`
+    each run for every completed day. This is idempotent and self-healing (a
+    later backfill of a past day is reflected), and it fixes the pre-hardening
+    bug where the code summarised the first hour of the new day, leaving
+    `daily_return` at 0.0 on 117 of 130 rows. It is also immune to the v1->v2
+    schema change that an append would mis-align. The pre-hardening file is
+    preserved once, beside the new one.
+    """
+    import pandas as pd
+
     summary_path = log_cfg["daily_summary_log"]
+    rows = [r for r in daily_rows(load_ledger(log_cfg["prediction_log"]))
+            if r["date"] < today]
+    if not rows:
+        return
 
-    # Check if we already have a summary for today
-    if os.path.exists(summary_path):
-        import csv
+    # Preserve the pre-hardening (v1) summary once before taking ownership.
+    if os.path.exists(summary_path) and read_schema_version(summary_path) < SCHEMA_VERSION:
+        backup = summary_path + ".pre-ws2.bak"
+        if not os.path.exists(backup):
+            os.replace(summary_path, backup)
+            logger.info(f"Preserved pre-WS2 daily summary at {backup}")
 
-        with open(summary_path) as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row.get("date") == today:
-                    return  # Already logged
-
-    summary = compute_daily_summary(log_cfg["prediction_log"], today, state)
-    if summary:
-        append_daily_summary(summary_path, summary)
-        logger.info(f"Daily summary logged for {today}")
+    df = pd.DataFrame(rows)
+    df.insert(0, "schema_version", SCHEMA_VERSION)
+    df = df[[c for c in DAILY_SUMMARY_FIELDS if c in df.columns]]
+    os.makedirs(os.path.dirname(summary_path) or ".", exist_ok=True)
+    df.to_csv(summary_path, index=False)
+    logger.info(f"Daily summary regenerated: {len(df)} completed day(s)")
 
 
 def run_daily_report(config: dict) -> int:

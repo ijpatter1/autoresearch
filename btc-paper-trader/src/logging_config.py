@@ -1,11 +1,23 @@
-"""Logging configuration: CSV loggers and rotating system log."""
+"""Logging configuration: CSV loggers and rotating system log.
+
+Schema versioning (hardening spec WS2). The pre-hardening logs carried bare
+headers with no version marker, so adding a column would silently break any
+reader that assumed positional columns (including `replay.py`). Every log now
+leads with a `schema_version` column; a reader that checks it can tell v1
+(pre-hardening) from v2 (decided/frozen split) before trusting any position.
+"""
 
 import csv
 import logging
 import os
 from logging.handlers import RotatingFileHandler
 
+# Bumped to 2 when the decided/frozen split (WS2) added `hour_status` to the
+# prediction log and the parallel P&L series to the daily summary.
+SCHEMA_VERSION = 2
+
 PREDICTION_FIELDS = [
+    "schema_version",
     "timestamp",
     "pred_24_raw",
     "pred_72_raw",
@@ -32,9 +44,11 @@ PREDICTION_FIELDS = [
     "btc_return_1h",
     "bip_n_contracts",
     "bip_fee_cost",
+    "hour_status",  # decided | frozen (WS2)
 ]
 
 TRADE_FIELDS = [
+    "schema_version",
     "timestamp",
     "direction",
     "size",
@@ -45,14 +59,18 @@ TRADE_FIELDS = [
 ]
 
 DAILY_SUMMARY_FIELDS = [
+    "schema_version",
     "date",
     "portfolio_value",
-    "daily_return",
+    "daily_return",       # combined (decided + frozen), for back-compat
+    "decided_return",     # WS2 parallel series
+    "frozen_return",      # WS2 parallel series
     "drawdown",
     "n_trades_today",
     "avg_position_size",
     "max_position_size",
     "hours_flat",
+    "hours_frozen",       # WS2: hours whose position was carried, not decided
     "sharpe_running",
     "total_funding_cost",
 ]
@@ -118,16 +136,44 @@ def _append_csv_row(path: str, row: dict, fields: list[str]) -> None:
         logging.getLogger(__name__).error(f"Failed to write CSV row to {path}: {e}")
 
 
+def _stamped(row: dict) -> dict:
+    """Row with the current schema version stamped (caller value wins)."""
+    if row.get("schema_version") in (None, ""):
+        return {**row, "schema_version": SCHEMA_VERSION}
+    return row
+
+
 def append_prediction_row(path: str, row: dict) -> None:
     """Append one row to the prediction log CSV."""
-    _append_csv_row(path, row, PREDICTION_FIELDS)
+    _append_csv_row(path, _stamped(row), PREDICTION_FIELDS)
 
 
 def append_trade_row(path: str, row: dict) -> None:
     """Append one row to the trade log CSV."""
-    _append_csv_row(path, row, TRADE_FIELDS)
+    _append_csv_row(path, _stamped(row), TRADE_FIELDS)
 
 
 def append_daily_summary(path: str, row: dict) -> None:
     """Append one row to the daily summary CSV."""
-    _append_csv_row(path, row, DAILY_SUMMARY_FIELDS)
+    _append_csv_row(path, _stamped(row), DAILY_SUMMARY_FIELDS)
+
+
+def read_schema_version(path: str) -> int:
+    """Schema version of a CSV log: the `schema_version` column if present,
+    else 1 (a pre-hardening log with a bare header). 0 if the file is absent."""
+    if not os.path.exists(path):
+        return 0
+    try:
+        with open(path, newline="") as f:
+            header = next(csv.reader(f), [])
+    except (OSError, StopIteration):
+        return 0
+    if "schema_version" not in header:
+        return 1
+    try:
+        with open(path, newline="") as f:
+            reader = csv.DictReader(f)
+            first = next(reader, None)
+        return int(first["schema_version"]) if first else 1
+    except (OSError, ValueError, KeyError, TypeError):
+        return 1
