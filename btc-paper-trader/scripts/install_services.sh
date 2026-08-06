@@ -102,7 +102,7 @@ mkdir -p "$ENV_DIR"
 if [ ! -f "$ENV_FILE" ]; then
     install -o "$SERVICE_USER" -g "$SERVICE_USER" -m 600 \
         "${SCRIPT_DIR}/deploy/btc-paper-trader.env.example" "$ENV_FILE"
-    echo "  Scaffolded $ENV_FILE (mode 600) — populate HEARTBEAT_PING_URL when WS3 lands"
+    echo "  Scaffolded $ENV_FILE (mode 600) — populate HEARTBEAT_PING_URL before enabling the timer (WS3)"
 fi
 
 # --- Unit files: copy verbatim, then verify byte-identical ---
