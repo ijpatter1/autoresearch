@@ -1,0 +1,14 @@
+[Unit]
+Description=BTC Paper Trader - supplementary archiver timer
+
+[Timer]
+# Two past every hour: near the top of the hour so the snapshot represents its
+# stamped hour, and before the trader's :05 run.
+OnCalendar=*-*-* *:02:00
+# After host downtime, fire immediately: the current hour is still capturable
+# even though the missed ones are gone (they get explicit gap rows).
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

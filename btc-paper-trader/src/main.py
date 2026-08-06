@@ -55,7 +55,6 @@ from .portfolio import (
     save_portfolio_state,
 )
 from .report import deliver_report, generate_report
-from .supplementary import append_supplementary_row, fetch_open_interest, fetch_orderbook_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -256,8 +255,10 @@ def _run_pipeline(config: dict, rs: _RunState) -> int:
     new_rows = len(df) - prev_len
     logger.info(f"{elapsed()} Parquet saved: {len(df)} rows ({'+' + str(new_rows) if new_rows else 'dedup'})")
 
-    # --- Fetch supplementary data (non-critical; current hour only) ---
-    _fetch_supplementary(config, candle["close"])
+    # Supplementary capture (order book / open interest / funding) no longer
+    # runs here: it lives in src.archiver on its own timer (WS7), so it does
+    # not inherit this pipeline's aborts the way the audited 65.5%-coverage
+    # record did.
 
     # --- Process the current hour, plus any hours missed during an outage ---
     # Each pending hour is booked individually from the backfilled candles, so
@@ -418,37 +419,6 @@ def _existing_timestamps(path: str) -> set:
         return set(pd.read_csv(path, usecols=["timestamp"])["timestamp"].astype(str))
     except Exception:
         return set()
-
-
-def _fetch_supplementary(config: dict, btc_price: float) -> None:
-    """Fetch order book snapshot and open interest (non-critical)."""
-    data_cfg = config["data"]
-    supp_cfg = config.get("supplementary", {})
-
-    try:
-        ob = fetch_orderbook_snapshot(
-            symbol=data_cfg["symbol"],
-            base_url=data_cfg["binance_base_url"],
-        )
-        if ob:
-            ob_path = supp_cfg.get("orderbook_path", "data/orderbook_1h.parquet")
-            append_supplementary_row(ob_path, ob)
-            logger.info(f"Order book snapshot: spread={ob['spread_bps']:.1f}bps")
-    except Exception as e:
-        logger.warning(f"Order book fetch failed (non-critical): {e}")
-
-    try:
-        oi = fetch_open_interest(
-            kraken_futures_url=data_cfg.get("kraken_futures_url", "https://futures.kraken.com"),
-            kraken_symbol=data_cfg.get("kraken_symbol", "PF_XBTUSD"),
-            btc_price=btc_price,
-        )
-        if oi:
-            oi_path = supp_cfg.get("open_interest_path", "data/open_interest_1h.parquet")
-            append_supplementary_row(oi_path, oi)
-            logger.info(f"Open interest: {oi['open_interest']:.2f} BTC")
-    except Exception as e:
-        logger.warning(f"Open interest fetch failed (non-critical): {e}")
 
 
 def _maybe_log_daily_summary(log_cfg: dict, today: str, state: PortfolioState) -> None:

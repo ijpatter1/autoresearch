@@ -1,0 +1,28 @@
+[Unit]
+Description=BTC Paper Trader - supplementary data archiver (order book / OI / funding)
+Documentation=file:/opt/btc-paper-trader/hardening-spec.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=btctrader
+Group=btctrader
+WorkingDirectory=/opt/btc-paper-trader
+ExecStart=/opt/btc-paper-trader/.venv/bin/python -m src.archiver
+
+# Deliberately its own service, not part of the trading pipeline (WS7): this
+# data cannot be backfilled, so capture must not inherit pipeline aborts. Logs
+# go to journald only; the trader's rotating system.log is not shared across
+# processes. A failed fetch is not a unit failure — the missed hour is written
+# as an explicit gap row by the next successful run.
+
+# Sandboxing: same confinement as the trader on the shared Pi.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/btc-paper-trader/data /opt/btc-paper-trader/logs
+
+[Install]
+WantedBy=multi-user.target
