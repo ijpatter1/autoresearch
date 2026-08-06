@@ -9,7 +9,10 @@ Type=oneshot
 User=btctrader
 Group=btctrader
 WorkingDirectory=/opt/btc-paper-trader
-# Optional (leading '-'): holds HEARTBEAT_PING_URL once WS3 lands. Absent is fine for now.
+# Holds HEARTBEAT_PING_URL (WS3 dead-man's switch). The leading '-' lets the
+# unit start if the file is absent; the app then refuses to run with a clear
+# message when the heartbeat is enabled but its URL is unset (better than a bare
+# systemd EnvironmentFile error).
 EnvironmentFile=-/etc/btc-paper-trader/btc-paper-trader.env
 ExecStart=/opt/btc-paper-trader/.venv/bin/python -m src.main
 

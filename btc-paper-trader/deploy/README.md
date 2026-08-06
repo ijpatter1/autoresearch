@@ -69,3 +69,53 @@ gap is left for WS2 frozen-gap tagging.
 
 The liquidation websocket aggregator is **not** installed here — supplementary
 capture is hardened in WS7 (PR4).
+
+## Monitoring (WS3)
+
+The system is meant to run silently: a healthy week produces no notifications at
+all. The only page that ever fires is the one that says it stopped.
+
+### Dead-man's switch (heartbeat)
+
+On every successful run the trader pings a healthchecks.io check; if the pings
+stop arriving, healthchecks.io pages Ian. Absence is what the audited run failed
+to catch (35% of hours simply missing, nothing watching for it), so absence is
+what alerts.
+
+The ping URL is a credential and is never committed. `config.yaml` stores only
+the name of the env var that holds it (`monitoring.heartbeat.url_env:
+HEARTBEAT_PING_URL`); the value lives in `/etc/btc-paper-trader/btc-paper-trader.env`
+(mode 600, outside the repo). Startup fails hard if that env var is unset, empty,
+or still a placeholder — so a misconfigured switch stops the trader rather than
+letting a dead process look alive. Set `monitoring.heartbeat.enabled: false` to
+run without it (local dev only).
+
+Configure the healthchecks.io check's period and grace so a stopped trader pages
+within 90 minutes: hourly period, ~35-minute grace. A `/fail` ping is sent on a
+critical failure (exit 2) for an immediate page; a transient data-fetch miss
+(exit 1) pings neither and is absorbed by the next tick.
+
+### Alert file
+
+`logs/alerts.log` is deduplicated by signature: a warning that fires every hour
+for months is one line with a count and a first/last window, not thousands of
+repeated lines (the audited log had 1,654). The structured state is in
+`logs/alerts.log.state.json`; the `.log` is a rendered view. A pre-WS3 append-only
+alert log is preserved once at `logs/alerts.log.pre-ws3.bak`.
+
+### Log rotation
+
+`system.log` rotates in-process via a `RotatingFileHandler`
+(`system_log_max_bytes` / `system_log_backup_count` in `config.yaml`), so no
+external `logrotate` is added — it would rename the file out from under the
+handler. `alerts.log` is bounded by dedup rather than rotation. `cron.log` no
+longer exists: under systemd, run output goes to journald
+(`journalctl -u btc-paper-trader.service`).
+
+### Disk check
+
+On this shared Pi a full SD card is a real risk (Tally shares the host), so the
+disk check alerts on the fill *rate* as well as the level: a card trending toward
+full within `alerts.disk_fill_horizon_days` pages before it hits
+`alerts.disk_pct_threshold`. The rolling free-space history lives in
+`logs/disk_history.json`.

@@ -22,6 +22,7 @@ import pandas as pd
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src import models
 from src.data import load_parquet
 from src.inference import (
     FullInferenceResult,
@@ -494,12 +495,185 @@ def _max_abs_position(pred_log):
     return float(df["position"].abs().max())
 
 
+# --------------------------------------------------------------------------- #
+# Champion / challenger side-by-side replay (hardening spec WS6)               #
+# --------------------------------------------------------------------------- #
+
+def _book_replay_rows(df, artifacts, pred_log, trade_log, start_ts, end_ts,
+                      trading_cfg, bip_cfg):
+    """Book each hour in [start, end] into its own ledger; return final state.
+
+    A stripped copy of `replay()`'s inner loop for the side-by-side driver: it
+    writes only the ledger and leaves reporting to `_compute_segment_metrics`
+    and the combined section. `replay()` itself is untouched — its parity report
+    and tests depend on it verbatim.
+    """
+    for f in (pred_log, trade_log):
+        if os.path.exists(f):
+            os.unlink(f)
+
+    result = run_inference_full(df, artifacts)
+    ts_index = pd.DatetimeIndex(result.timestamps)
+    close_prices = df.set_index("timestamp").reindex(ts_index)["close"].values
+    funding_rates = np.zeros(len(ts_index))
+    if "funding_rate" in df.columns:
+        funding_rates = df.set_index("timestamp").reindex(ts_index)["funding_rate"].fillna(0.0).values
+
+    mask = (ts_index >= start_ts) & (ts_index <= end_ts)
+    indices = np.where(mask)[0]
+
+    state = PortfolioState()
+    for idx in indices:
+        ts = ts_index[idx]
+        price = float(close_prices[idx])
+        fr = float(funding_rates[idx])
+        pf = float(result.pred_final[idx])
+        if not np.isfinite(pf):
+            pf = 0.0
+
+        position = compute_position(
+            pf, sigma_threshold=trading_cfg["sigma_threshold"],
+            sigma_full=trading_cfg["sigma_full_position"])
+        new_state, metrics = update_portfolio(
+            state, position, price, fee_rate=trading_cfg["fee_rate"],
+            slippage_rate=trading_cfg["slippage_rate"], funding_rate=fr)
+        bip = compute_bip_fees(
+            position_delta=metrics["position_delta"], btc_price=price,
+            contract_size=bip_cfg.get("contract_size", 0.01),
+            fee_per_contract=bip_cfg.get("fee_per_contract", 0.46),
+            slippage_bps=bip_cfg.get("slippage_bps", 5.0))
+
+        append_prediction_row(pred_log, {
+            "timestamp": str(ts),
+            "pred_24_raw": result.pred_24_raw[idx],
+            "pred_72_raw": result.pred_72_raw[idx],
+            "pred_72_smoothed": result.pred_72_smoothed[idx],
+            "sign_agree": result.sign_agree[idx],
+            "pred_after_72h": result.pred_after_72h[idx],
+            "conf_prob": result.conf_prob[idx],
+            "conf_smoothed": result.conf_smoothed[idx],
+            "conf_norm": result.conf_norm[idx],
+            "conf_adj": result.conf_adj[idx],
+            "pred_after_conf": result.pred_after_72h[idx] * result.conf_adj[idx],
+            "pos_scaler_signal": result.pos_scaler_signal[idx],
+            "pos_scale": result.pos_scale[idx],
+            "pred_after_pos": result.pred_after_72h[idx] * result.conf_adj[idx] * result.pos_scale[idx],
+            "pred_after_scale": result.pred_after_scale[idx],
+            "pred_final": pf,
+            "position": metrics["position"],
+            "position_prev": metrics["position_prev"],
+            "position_delta": metrics["position_delta"],
+            "fee_cost": metrics["fee_cost"],
+            "funding_rate": fr,
+            "funding_cost": metrics["funding_cost"],
+            "btc_price": price,
+            "btc_return_1h": metrics["btc_return_1h"],
+            "bip_n_contracts": bip["n_contracts"],
+            "bip_fee_cost": bip["total_bip_cost"],
+            "hour_status": "decided",  # replay is continuous
+        })
+
+        if metrics["position_changed"]:
+            direction = "long" if position > 1e-6 else ("short" if position < -1e-6 else "flat")
+            append_trade_row(trade_log, {
+                "timestamp": str(ts), "direction": direction, "size": abs(position),
+                "entry_price": price, "pred_sigma": pf,
+                "conf_adj": result.conf_adj[idx], "pos_scale": result.pos_scale[idx],
+            })
+
+        state = new_state
+    return state
+
+
+def render_combined_section(rows: list[dict]) -> str:
+    """The single combined report section comparing every model side by side."""
+    lines = [
+        "Champion / challenger — side-by-side replay",
+        "=" * 44,
+        "",
+        "Same pipeline, same window; each model runs on its own ledger. The control",
+        "(943751e) is the permanent benchmark, and challengers are judged against what",
+        "it DID over the live record — long-only in practice (0 shorts in 136 days),",
+        "the post-processing chain shrinking raw predictions ~5x — not a symmetric",
+        "backtest it never traded (WS6). The shorts column below is per replay window.",
+        "",
+    ]
+    header = (f"  {'model':<22} {'role':<10} {'final PV':>9} {'return':>8} "
+              f"{'Sharpe':>7} {'maxDD':>7} {'dir chg':>8} {'shorts':>7}")
+    lines.append(header)
+    lines.append("  " + "-" * (len(header) - 2))
+    for r in rows:
+        lines.append(
+            f"  {r['id']:<22} {r['role']:<10} {r['final_pv']:>9.4f} "
+            f"{r['total_return']:>7.2f}% {r['sharpe']:>7.2f} "
+            f"{r['max_drawdown']:>6.2f}% {r['direction_changes']:>8} {r['short_trades']:>7}"
+        )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def replay_side_by_side(config: dict, start: str, end: str,
+                        output_dir: str = "logs/replay_cc") -> list[dict]:
+    """Replay the whole roster side by side (WS6 acceptance).
+
+    Each model books into its own subdirectory — separate state, ledger, trade
+    log — so challengers never collide with the control. Returns a per-model
+    metrics list and writes one combined `champion_challenger.txt` section.
+    """
+    trading_cfg = config["trading"]
+    bip_cfg = config.get("bip_tracking", {})
+
+    df = load_parquet(config["data"]["parquet_path"])
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    data_end = df["timestamp"].max()
+    if end_ts > data_end:
+        print(f"WARNING: --end {end_ts} after data end {data_end}, clamping")
+        end_ts = data_end
+
+    specs = models.load_model_specs(config)
+    os.makedirs(output_dir, exist_ok=True)
+
+    rows = []
+    for spec in specs:
+        out_dir = os.path.join(output_dir, spec.id)
+        os.makedirs(out_dir, exist_ok=True)
+        pred_log = os.path.join(out_dir, "predictions.csv")
+        trade_log = os.path.join(out_dir, "trades.csv")
+
+        print(f"Replaying {spec.role} '{spec.id}' -> {out_dir}/")
+        artifacts = load_artifacts(spec.artifact_path)
+        if not validate_artifacts(artifacts):
+            print(f"ERROR: artifact validation failed for {spec.id}")
+            continue
+        state = _book_replay_rows(df, artifacts, pred_log, trade_log,
+                                  start_ts, end_ts, trading_cfg, bip_cfg)
+        m = _compute_segment_metrics(pred_log, start_ts, end_ts)
+        rows.append({
+            "id": spec.id, "role": spec.role, "final_pv": state.portfolio_value,
+            "total_return": m["total_return"], "sharpe": m["sharpe"],
+            "max_drawdown": m["max_drawdown"], "direction_changes": m["direction_changes"],
+            "n_trades": m["n_trades"], "long_trades": m["long_trades"],
+            "short_trades": m["short_trades"], "n_hours": m["n_hours"],
+            "win_rate": m["win_rate"], "realised": spec.realised,
+        })
+
+    section = render_combined_section(rows)
+    with open(os.path.join(output_dir, "champion_challenger.txt"), "w") as f:
+        f.write(section)
+    print("\n" + section)
+    print(f"Side-by-side output: {output_dir}/")
+    return rows
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Replay historical data through paper trading pipeline")
     parser.add_argument("--start", required=True, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end", default=None, help="End date (YYYY-MM-DD). Default: yesterday")
     parser.add_argument("--config", default="config.yaml", help="Config file path")
-    parser.add_argument("--output-dir", default="logs/replay", help="Output directory")
+    parser.add_argument("--output-dir", default=None, help="Output directory")
+    parser.add_argument("--side-by-side", action="store_true",
+                        help="Replay the whole champion/challenger roster in parallel (WS6)")
     args = parser.parse_args()
 
     # Default end to yesterday
@@ -509,9 +683,18 @@ if __name__ == "__main__":
     # Change to project root
     os.chdir(Path(__file__).resolve().parent.parent)
 
-    replay(
-        start=args.start,
-        end=args.end,
-        config_path=args.config,
-        output_dir=args.output_dir,
-    )
+    if args.side_by_side:
+        import yaml
+        with open(args.config) as f:
+            config = yaml.safe_load(f)
+        replay_side_by_side(
+            config, start=args.start, end=args.end,
+            output_dir=args.output_dir or "logs/replay_cc",
+        )
+    else:
+        replay(
+            start=args.start,
+            end=args.end,
+            config_path=args.config,
+            output_dir=args.output_dir or "logs/replay",
+        )

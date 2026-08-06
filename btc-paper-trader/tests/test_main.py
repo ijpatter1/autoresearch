@@ -8,11 +8,14 @@ import pandas as pd
 import pytest
 
 import src.main as main_mod
+from src import heartbeat
 from src.data import load_parquet
 from src.logging_config import append_prediction_row, read_schema_version
 from src.main import (
+    _RunState,
     _append_new_rows,
     _existing_timestamps,
+    _finalize_monitoring,
     _maybe_log_daily_summary,
     _resume_point,
     run_hourly,
@@ -134,6 +137,78 @@ class TestDailySummaryRegeneration:
         backup = tmp_path / "daily_summary.csv.pre-ws2.bak"
         assert backup.exists()  # original preserved
         assert read_schema_version(str(summary)) == 2  # new file is v2
+
+
+class TestFinalizeMonitoring:
+    """WS3: health checks + heartbeat run in `finally`, so they fire on the
+    early-return paths the old code could never reach."""
+
+    def _hb_config(self, tmp_path, monkeypatch, url="https://hc-ping.com/abc"):
+        monkeypatch.setenv("HEARTBEAT_PING_URL", url)
+        calls = []
+        monkeypatch.setattr(heartbeat, "_http_get",
+                            lambda u, timeout: calls.append(u))
+        config = {
+            "alerts": {"alert_file": str(tmp_path / "logs" / "alerts.log")},
+            "monitoring": {"heartbeat": {"enabled": True,
+                                         "url_env": "HEARTBEAT_PING_URL",
+                                         "timeout_seconds": 5}},
+        }
+        return config, calls
+
+    def test_success_pings_bare_url(self, tmp_path, monkeypatch):
+        config, calls = self._hb_config(tmp_path, monkeypatch)
+        _finalize_monitoring(config, _RunState(), 0)
+        assert calls == ["https://hc-ping.com/abc"]
+
+    def test_critical_failure_pings_fail_endpoint(self, tmp_path, monkeypatch):
+        config, calls = self._hb_config(tmp_path, monkeypatch)
+        _finalize_monitoring(config, _RunState(), 2)
+        assert calls == ["https://hc-ping.com/abc/fail"]
+
+    def test_transient_failure_pings_neither(self, tmp_path, monkeypatch):
+        config, calls = self._hb_config(tmp_path, monkeypatch)
+        _finalize_monitoring(config, _RunState(), 1)
+        assert calls == []  # rc==1 is retried next tick; absence would page
+
+    def test_data_outage_records_staleness_alert(self, tmp_path):
+        # A stale df with a non-zero rc (data-source outage) still records the
+        # data-staleness alert — the finally is what makes that reachable.
+        (tmp_path / "logs").mkdir()
+        df = pd.DataFrame({"timestamp": pd.date_range("2026-01-01", periods=3, freq="h"),
+                           "close": [1, 2, 3]})
+        config = {"alerts": {"alert_file": str(tmp_path / "logs" / "alerts.log")}}
+        _finalize_monitoring(config, _RunState(df=df), 1)
+        text = (tmp_path / "logs" / "alerts.log").read_text()
+        assert "stale" in text.lower()
+
+    def test_ping_outage_does_not_raise(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HEARTBEAT_PING_URL", "https://hc-ping.com/abc")
+        monkeypatch.setattr(heartbeat, "_http_get",
+                            lambda u, t: (_ for _ in ()).throw(OSError("down")))
+        config = {
+            "alerts": {"alert_file": str(tmp_path / "logs" / "alerts.log")},
+            "monitoring": {"heartbeat": {"enabled": True, "url_env": "HEARTBEAT_PING_URL"}},
+        }
+        _finalize_monitoring(config, _RunState(), 0)  # must not raise
+
+
+class TestStartupHeartbeatValidation:
+    """WS3/D3: an enabled-but-undeliverable heartbeat refuses to start."""
+
+    def _config(self, tmp_path):
+        return {
+            "data": {"parquet_path": str(tmp_path / "data" / "btcusdt_1h.parquet")},
+            "monitoring": {"heartbeat": {"enabled": True, "url_env": "HEARTBEAT_PING_URL"}},
+        }
+
+    def test_placeholder_url_refuses_to_start(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HEARTBEAT_PING_URL", "https://hc-ping.com/your-uuid-here")
+        assert run_hourly(self._config(tmp_path)) == 2
+
+    def test_unset_url_refuses_to_start(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("HEARTBEAT_PING_URL", raising=False)
+        assert run_hourly(self._config(tmp_path)) == 2
 
 
 class TestHourlyRunEndToEnd:

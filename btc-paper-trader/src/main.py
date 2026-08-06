@@ -16,11 +16,14 @@ import logging
 import os
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
 
+from . import heartbeat
 from .alerts import run_health_checks, write_alerts
+from .models import is_control_artifact
 from .data import (
     append_candle,
     backfill_recent_gap,
@@ -74,11 +77,36 @@ def _acquire_lock(lock_path: str):
         return None
 
 
+@dataclass
+class _RunState:
+    """Whatever the pipeline has established so far, for monitoring in `finally`.
+
+    Populated as the run progresses so the health checks can run even when the
+    pipeline aborts early — a data-source outage that returns before the normal
+    end must still record the staleness alert it exists to detect.
+    """
+    df: object = None
+    artifact_trained_at: str | None = None
+    exempt_staleness: bool = False
+    pred_final: float = 0.0
+    portfolio_value: float = 1.0
+    peak_value: float = 1.0
+
+
 def run_hourly(config: dict) -> int:
     """Execute the hourly inference pipeline.
 
     Returns exit code: 0=success, 1=data fetch failed, 2=inference failed.
     """
+    # Monitoring that cannot deliver is a fatal misconfiguration (WS3/D3): refuse
+    # to start if the dead-man's switch is enabled but its ping URL is unset,
+    # empty, or a placeholder. This is the inverse of the Telegram failure that
+    # 404'd silently for 136 days because nothing validated the target.
+    hb_err = heartbeat.validate_heartbeat_config(config)
+    if hb_err:
+        logger.error(f"FATAL: heartbeat misconfigured — {hb_err}")
+        return 2
+
     # Prevent concurrent runs
     lock_path = os.path.join(os.path.dirname(config["data"]["parquet_path"]), ".lockfile")
     lock_fh = _acquire_lock(lock_path)
@@ -94,7 +122,27 @@ def run_hourly(config: dict) -> int:
 
 
 def _run_hourly_inner(config: dict) -> int:
-    """Inner hourly pipeline (called with lock held)."""
+    """Run the pipeline, then finalize monitoring regardless of how it ended.
+
+    Health checks and the heartbeat live in the `finally` so they fire on the
+    early-return paths too (WS3): before this fix `run_health_checks` sat past
+    every `return`, so the data-staleness check could never run during the
+    outage it was written for.
+    """
+    rs = _RunState()
+    rc = 2
+    try:
+        rc = _run_pipeline(config, rs)
+    except Exception as e:
+        logger.error(f"Hourly run failed: {e}", exc_info=True)
+        rc = 2
+    finally:
+        _finalize_monitoring(config, rs, rc)
+    return rc
+
+
+def _run_pipeline(config: dict, rs: _RunState) -> int:
+    """The hourly pipeline body. Populates `rs` as monitorable state is established."""
     start_time = time.time()
     data_cfg = config["data"]
     model_cfg = config["model"]
@@ -114,6 +162,11 @@ def _run_hourly_inner(config: dict) -> int:
             logger.error(f"{elapsed()} Artifact validation failed")
             return 2
         logger.info(f"{elapsed()} Artifacts loaded: commit={artifacts['commit']}")
+        rs.artifact_trained_at = artifacts.get("trained_at")
+        # The staleness alarm is repointed off the frozen control (WS6): a
+        # permanent control alarmed for being frozen is the contradiction WS6
+        # resolves. Challengers, when added, are not exempt.
+        rs.exempt_staleness = is_control_artifact(config, artifact_path)
     except Exception as e:
         logger.error(f"{elapsed()} Failed to load artifacts: {e}")
         return 2
@@ -133,6 +186,7 @@ def _run_hourly_inner(config: dict) -> int:
     parquet_path = data_cfg["parquet_path"]
     try:
         df = load_parquet(parquet_path)
+        rs.df = df  # available to the staleness check even on an early abort below
         logger.info(f"{elapsed()} Parquet loaded: {len(df)} rows")
     except Exception as e:
         logger.error(f"{elapsed()} Failed to load parquet: {e}")
@@ -187,6 +241,7 @@ def _run_hourly_inner(config: dict) -> int:
         primary_venue=primary_venue, allow_venue_mismatch=allow_venue_mismatch,
     )
     save_parquet(df, parquet_path)
+    rs.df = df  # freshest frame, incl. the current candle, for the freshness check
     new_rows = len(df) - prev_len
     logger.info(f"{elapsed()} Parquet saved: {len(df)} rows ({'+' + str(new_rows) if new_rows else 'dedup'})")
 
@@ -234,28 +289,57 @@ def _run_hourly_inner(config: dict) -> int:
         )
 
     final_state = pending.new_state
+    rs.pred_final = float(pending.pred_rows[-1]["pred_final"]) if pending.n_processed else 0.0
+    rs.portfolio_value = final_state.portfolio_value
+    rs.peak_value = final_state.peak_value
 
     # --- Daily summary (first run of new day) ---
     today = str(candle["timestamp"].date()) if hasattr(candle["timestamp"], "date") else str(candle["timestamp"])[:10]
     _maybe_log_daily_summary(log_cfg, today, final_state)
 
-    # --- Health checks ---
-    last_pred_final = float(pending.pred_rows[-1]["pred_final"]) if pending.n_processed else 0.0
-    alerts = run_health_checks(
-        config=config,
-        df=df,
-        pred_final=last_pred_final,
-        portfolio_value=final_state.portfolio_value,
-        peak_value=final_state.peak_value,
-        artifact_trained_at=artifacts["trained_at"],
-    )
-    if alerts:
-        write_alerts(alerts, config["alerts"]["alert_file"])
-        for alert in alerts:
-            logger.warning(f"ALERT: {alert}")
-
+    # Health checks and the heartbeat run in _finalize_monitoring (the finally),
+    # so they fire on the early-return paths above as well.
     logger.info(f"{elapsed()} === Hourly run complete ===")
     return 0
+
+
+def _disk_state_path(config: dict) -> str:
+    """Where the disk fill-rate history lives — beside the alert file."""
+    alert_file = config.get("alerts", {}).get("alert_file", "logs/alerts.log")
+    return os.path.join(os.path.dirname(alert_file) or ".", "disk_history.json")
+
+
+def _finalize_monitoring(config: dict, rs: _RunState, rc: int) -> None:
+    """Run health checks and ping the heartbeat — always, however the run ended.
+
+    Heartbeat policy: success ping only on a clean run (rc==0); a `/fail` ping on
+    a critical failure (rc==2) so the switch alerts immediately rather than
+    waiting out the grace period. A transient data-fetch miss (rc==1) pings
+    neither — it is retried next tick, and if it persists the absence pages on
+    its own. A failed ping is logged, not raised.
+    """
+    try:
+        alerts = run_health_checks(
+            config=config,
+            df=rs.df,
+            pred_final=rs.pred_final,
+            portfolio_value=rs.portfolio_value,
+            peak_value=rs.peak_value,
+            artifact_trained_at=rs.artifact_trained_at,
+            exempt_staleness=rs.exempt_staleness,
+            disk_state_path=_disk_state_path(config),
+        )
+        if alerts:
+            write_alerts(alerts, config.get("alerts", {}).get("alert_file", "logs/alerts.log"))
+            for alert in alerts:
+                logger.warning(f"ALERT: {alert}")
+    except Exception as e:  # monitoring must never mask the run's own outcome
+        logger.error(f"Health checks failed (non-fatal): {e}", exc_info=True)
+
+    if rc == 0:
+        heartbeat.ping(config, kind="success")
+    elif rc == 2:
+        heartbeat.ping(config, kind="fail")
 
 
 def _resume_point(state, prediction_log_path, df, trading_cfg):

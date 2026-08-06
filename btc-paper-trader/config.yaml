@@ -18,6 +18,43 @@ model:
   scale_factor: 0.35
   ema_span: 20
 
+models:
+  # Champion/challenger roster (hardening spec WS6). Artifact 943751e is the
+  # PERMANENT control — never retrained, replaced, or improved in place. The
+  # research agent's future exports run BESIDE it as challengers with their own
+  # state, ledger, and report files (same pipeline, in parallel), so a challenger
+  # can never collide with the control's records. The 30-day staleness alarm is
+  # repointed at challengers only: the control is exempt by design, resolving the
+  # contradiction of a frozen model alarmed for being frozen.
+  - id: control-943751e
+    role: control
+    artifact_path: artifacts/model_943751e.joblib
+    state_path: data/portfolio_state.json
+    prediction_log: logs/predictions.csv
+    trade_log: logs/trades.csv
+    daily_summary_log: logs/daily_summary.csv
+    report_path: logs/daily_report.txt
+    # Realised behaviour over the audited 136-day record — recorded so
+    # challengers are compared against what the control DID, not a symmetric
+    # backtest it never traded. It is long-only in practice (0 shorts in 118
+    # trades) not by a directional filter but because the post-processing chain
+    # shrinks raw predictions ~5x, so a short needs a raw pred below ~-1.05 sigma
+    # to clear the -0.20 entry threshold, which never happened.
+    realised:
+      shorts_taken: 0
+      long_trades: 107
+      episodes: 11
+      effective_shrink: 5.0
+      entry_threshold_sigma: -0.20
+      note: long-only in practice; symmetric backtest Sharpe not comparable to realised
+  # Challengers are appended as the agent exports them, e.g.:
+  #   - id: challenger-<commit>
+  #     role: challenger
+  #     artifact_path: artifacts/model_<commit>.joblib
+  #   (state/ledger/report default to logs/challengers/<commit>/… — never the
+  #    control's files). Promotion to a live-capital candidate is by
+  #    pre-registered gates only; see docs/champion-challenger.md.
+
 integrity:
   # Startup environment-integrity checks (hardening spec WS4). The artifact's
   # stored reference predictions are recomputed under the running environment
@@ -53,12 +90,39 @@ logging:
   system_log_max_bytes: 10485760  # 10MB
   system_log_backup_count: 3
 
+monitoring:
+  # Dead-man's switch (hardening spec WS3, decision D3). A healthy system is
+  # silent (D7); the only page that ever fires is the one that says it stopped.
+  # On every SUCCESSFUL run the trader pings an external heartbeat service
+  # (healthchecks.io). If the pings stop arriving, that service pages Ian — so
+  # its silence is what alerts, which is the fix for the failure actually
+  # observed (35% of hours simply absent, nothing watching for absence).
+  heartbeat:
+    enabled: true
+    # The ping URL is a CREDENTIAL — anyone holding it can forge heartbeats and
+    # keep a dead trader looking alive — so it is NEVER committed. Config stores
+    # only the NAME of the env var that holds it; the value reaches the process
+    # from the mode-600 EnvironmentFile on the Pi (deploy/btc-paper-trader.env),
+    # outside the repo. Startup fails hard if it is unset, empty, or still a
+    # placeholder — the Telegram failure mode (an unexpanded ${VAR} posted as a
+    # live value, 404ing silently for 136 days) inverted.
+    url_env: HEARTBEAT_PING_URL
+    timeout_seconds: 10
+
 alerts:
   method: file  # file | slack | telegram
   alert_file: logs/alerts.log
   drawdown_threshold: -0.10
   prediction_sanity_threshold: 2.0
   model_staleness_days: 30
+  # Disk check (WS3). On the dedicated Pi a full SD card is a real shared-tenant
+  # risk (Tally shares the host), so alert on the fill RATE as well as the level:
+  # a card trending toward full within the horizon pages before it hits the level
+  # threshold. On the macOS laptop this check was a false alarm (it measured the
+  # owner's whole APFS container); on the Pi it is meaningful.
+  disk_path: /
+  disk_pct_threshold: 0.90        # level: warn above this fraction used
+  disk_fill_horizon_days: 7       # rate: warn if projected full within this many days
 
 funding:
   model_funding_cost: true        # apply funding rate to P&L
